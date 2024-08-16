@@ -46,11 +46,15 @@
     "ws": "^8.18.0"
   },
   "peerDependencies": {
+    "@effect/cluster": "workspace:^",
     "@effect/platform": "workspace:^",
+    "@effect/rpc": "workspace:^",
     "effect": "workspace:^"
   },
   "devDependencies": {
+    "@effect/cluster": "workspace:^",
     "@effect/platform": "workspace:^",
+    "@effect/rpc": "workspace:^",
     "@types/tar": "^6.1.12",
     "@types/ws": "^8.5.12",
     "effect": "workspace:^",

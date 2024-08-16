@@ -114,7 +114,7 @@ export const make = (
         lookup: (sql: string) =>
           Effect.try({
             try: () => db.prepare(sql),
-            catch: (cause) => new SqlError({ cause, message: "Failed to prepare statement" })
+            catch: (cause) => new SqlError({ cause, message: "Failed to prepare statement " })
           })
       })
 
