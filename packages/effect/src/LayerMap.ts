@@ -1,5 +1,5 @@
 /**
- * @since 3.13.0
+ * @since 3.14.0
  */
 import * as Context from "./Context.js"
 import type * as Duration from "./Duration.js"
@@ -11,19 +11,19 @@ import * as Scope from "./Scope.js"
 import type { Mutable } from "./Types.js"
 
 /**
- * @since 3.13.0
+ * @since 3.14.0
  * @category Symbols
  */
 export const TypeId: unique symbol = Symbol.for("effect/LayerMap")
 
 /**
- * @since 3.13.0
+ * @since 3.14.0
  * @category Symbols
  */
 export type TypeId = typeof TypeId
 
 /**
- * @since 3.13.0
+ * @since 3.14.0
  * @category Models
  */
 export interface LayerMap<in K, in out I, out S, out E = never> {
@@ -52,7 +52,7 @@ export interface LayerMap<in K, in out I, out S, out E = never> {
 }
 
 /**
- * @since 3.13.0
+ * @since 3.14.0
  * @category Constructors
  *
  * A `LayerMap` allows you to create a map of Layer's that can be used to
@@ -165,7 +165,7 @@ export const make: <
 })
 
 /**
- * @since 3.13.0
+ * @since 3.14.0
  * @category Constructors
  */
 export const fromRecord = <
@@ -190,7 +190,7 @@ export const fromRecord = <
 > => make(tagOrAccessor, (key: keyof Layers) => layers[key], options)
 
 /**
- * @since 3.13.0
+ * @since 3.14.0
  * @category Service
  */
 export interface TagClass<
@@ -238,7 +238,7 @@ export interface TagClass<
 }
 
 /**
- * @since 3.13.0
+ * @since 3.14.0
  * @category Service
  *
  * Create a `LayerMap` service that provides a dynamic set of resources based on
@@ -352,12 +352,12 @@ export const Service = <Self>() =>
 }
 
 /**
- * @since 3.13.0
+ * @since 3.14.0
  * @category Service
  */
 export declare namespace Service {
   /**
-   * @since 3.13.0
+   * @since 3.14.0
    * @category Service
    */
   export type Key<Options> = Options extends { readonly lookup: (key: infer K) => any } ? K
@@ -365,7 +365,7 @@ export declare namespace Service {
     : never
 
   /**
-   * @since 3.13.0
+   * @since 3.14.0
    * @category Service
    */
   export type Layers<Options> = Options extends { readonly lookup: (key: infer _K) => infer Layers } ? Layers
@@ -373,13 +373,13 @@ export declare namespace Service {
     : never
 
   /**
-   * @since 3.13.0
+   * @since 3.14.0
    * @category Service
    */
   export type Error<Options> = Layers<Options> extends Layer.Layer<infer _A, infer _E, infer _R> ? _E : never
 
   /**
-   * @since 3.13.0
+   * @since 3.14.0
    * @category Service
    */
   export type Context<Options> = Layers<Options> extends Layer.Layer<infer _A, infer _E, infer _R> ? _R : never

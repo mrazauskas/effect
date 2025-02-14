@@ -407,7 +407,7 @@ export * as KeyedPool from "./KeyedPool.js"
 export * as Layer from "./Layer.js"
 
 /**
- * @since 3.13.0
+ * @since 3.14.0
  */
 export * as LayerMap from "./LayerMap.js"
 
