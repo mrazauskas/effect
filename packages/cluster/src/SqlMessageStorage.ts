@@ -229,23 +229,49 @@ export const make = Effect.fnUntraced(function*(options?: {
       sql`
         IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = ${replyLookupIndex})
         CREATE INDEX ${sql(replyLookupIndex)}
-        ON ${repliesTableSql} (request_id, id, kind, acked);
+        ON ${repliesTableSql} (request_id, kind, acked);
       `,
     mysql: () =>
       sql`
         CREATE INDEX ${sql(replyLookupIndex)}
-        ON ${repliesTableSql} (request_id, id, kind, acked);
+        ON ${repliesTableSql} (request_id, kind, acked);
       `.unprepared.pipe(Effect.ignore),
     pg: () =>
       sql`
         CREATE INDEX IF NOT EXISTS ${sql(replyLookupIndex)}
-        ON ${repliesTableSql} (request_id, id, kind, acked);
+        ON ${repliesTableSql} (request_id, kind, acked);
       `,
     orElse: () =>
       // sqlite
       sql`
         CREATE INDEX IF NOT EXISTS ${sql(replyLookupIndex)}
-        ON ${repliesTableSql} (request_id, id, kind, acked);
+        ON ${repliesTableSql} (request_id, kind, acked);
+      `
+  })
+
+  const replyRequestIdIndex = `${repliesTable}_request_id_idx`
+  yield* sql.onDialectOrElse({
+    mssql: () =>
+      sql`
+        IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = ${replyRequestIdIndex})
+        CREATE INDEX ${sql(replyRequestIdIndex)}
+        ON ${repliesTableSql} (request_id);
+      `,
+    mysql: () =>
+      sql`
+        CREATE INDEX ${sql(replyRequestIdIndex)}
+        ON ${repliesTableSql} (request_id);
+      `.unprepared.pipe(Effect.ignore),
+    pg: () =>
+      sql`
+        CREATE INDEX IF NOT EXISTS ${sql(replyRequestIdIndex)}
+        ON ${repliesTableSql} (request_id);
+      `,
+    orElse: () =>
+      // sqlite
+      sql`
+        CREATE INDEX IF NOT EXISTS ${sql(replyRequestIdIndex)}
+        ON ${repliesTableSql} (request_id);
       `
   })
 
