@@ -438,90 +438,95 @@ export const make = Effect.fnUntraced(function*(options?: {
   const sqlFalse = sql.literal(supportsBooleans ? "FALSE" : "0")
   const sqlTrue = sql.literal(supportsBooleans ? "TRUE" : "1")
 
+  const insertEnvelope: (
+    row: MessageRow,
+    message_id: string
+  ) => Effect.Effect<ReadonlyArray<Row>, SqlError> = sql.onDialectOrElse({
+    pg: () => (row, message_id) =>
+      sql`
+        WITH inserted AS (
+          INSERT INTO ${messagesTableSql} ${sql.insert(row)}
+          ON CONFLICT (message_id) DO NOTHING
+          RETURNING id
+        ),
+        existing AS (
+          SELECT m.id, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
+          FROM ${messagesTableSql} m
+          LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
+          WHERE m.message_id = ${message_id}
+          AND NOT EXISTS (SELECT 1 FROM inserted)
+          ORDER BY r.id DESC
+        )
+        SELECT * FROM existing
+      `,
+    mysql: () => (row, message_id) =>
+      sql`
+        SELECT m.id, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
+        FROM ${messagesTableSql} m
+        LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
+        WHERE m.message_id = ${message_id}
+        ORDER BY r.id DESC;
+        INSERT INTO ${messagesTableSql} ${sql.insert(row)}
+        ON DUPLICATE KEY UPDATE id = id;
+      `.unprepared.pipe(
+        Effect.map(([rows]) => rows as any as ReadonlyArray<Row>)
+      ),
+    mssql: () => (row, message_id) =>
+      sql`
+        MERGE ${messagesTableSql} WITH (HOLDLOCK) AS target
+        USING (SELECT ${message_id} as message_id) AS source
+        ON target.message_id = source.message_id
+        WHEN NOT MATCHED THEN
+          INSERT ${sql.insert(row)}
+        OUTPUT
+          inserted.id,
+          CASE
+            WHEN inserted.id IS NULL THEN (
+              SELECT TOP 1 r.id, r.kind, r.payload
+              FROM ${repliesTableSql} r
+              WHERE r.id = target.last_reply_id
+              ORDER BY r.id DESC
+            )
+          END as reply_id,
+          CASE
+            WHEN inserted.id IS NULL THEN (
+              SELECT TOP 1 r.kind
+              FROM ${repliesTableSql} r
+              WHERE r.id = target.last_reply_id
+            )
+          END as reply_kind,
+          CASE
+            WHEN inserted.id IS NULL THEN (
+              SELECT TOP 1 r.payload
+              FROM ${repliesTableSql} r
+              WHERE r.id = target.last_reply_id
+            )
+          END as reply_payload,
+          CASE
+            WHEN inserted.id IS NULL THEN (
+              SELECT TOP 1 r.sequence
+              FROM ${repliesTableSql} r
+              WHERE r.id = target.last_reply_id
+            )
+          END as reply_sequence;
+      `,
+    orElse: () => (row, message_id) =>
+      sql`
+        SELECT m.id, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
+        FROM ${messagesTableSql} m
+        LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
+        WHERE m.message_id = ${message_id}
+      `.pipe(
+        Effect.tap(sql`INSERT OR IGNORE INTO ${messagesTableSql} ${sql.insert(row)}`),
+        sql.withTransaction
+      )
+  })
+
   return yield* MessageStorage.makeEncoded({
     saveEnvelope: (envelope, message_id) =>
       Effect.suspend(() => {
         const row = envelopeToRow(envelope, message_id)
-        let insert = sql.onDialectOrElse({
-          pg: () =>
-            sql`
-              WITH inserted AS (
-                INSERT INTO ${messagesTableSql} ${sql.insert(row)}
-                ON CONFLICT (message_id) DO NOTHING
-                RETURNING id
-              ),
-              existing AS (
-                SELECT m.id, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
-                FROM ${messagesTableSql} m
-                LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
-                WHERE m.message_id = ${message_id}
-                AND NOT EXISTS (SELECT 1 FROM inserted)
-                ORDER BY r.id DESC
-              )
-              SELECT * FROM existing
-            `,
-          mysql: () =>
-            sql`
-              SELECT m.id, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
-              FROM ${messagesTableSql} m
-              LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
-              WHERE m.message_id = ${message_id}
-              ORDER BY r.id DESC;
-              INSERT INTO ${messagesTableSql} ${sql.insert(row)}
-              ON DUPLICATE KEY UPDATE id = id;
-`.unprepared.pipe(
-                Effect.map(([rows]) => rows as any as ReadonlyArray<Row>)
-              ),
-          mssql: () =>
-            sql`
-              MERGE ${messagesTableSql} WITH (HOLDLOCK) AS target
-              USING (SELECT ${message_id} as message_id) AS source
-              ON target.message_id = source.message_id
-              WHEN NOT MATCHED THEN
-                INSERT ${sql.insert(row)}
-              OUTPUT
-                inserted.id,
-                CASE
-                  WHEN inserted.id IS NULL THEN (
-                    SELECT TOP 1 r.id, r.kind, r.payload
-                    FROM ${repliesTableSql} r
-                    WHERE r.id = target.last_reply_id
-                    ORDER BY r.id DESC
-                  )
-                END as reply_id,
-                CASE
-                  WHEN inserted.id IS NULL THEN (
-                    SELECT TOP 1 r.kind
-                    FROM ${repliesTableSql} r
-                    WHERE r.id = target.last_reply_id
-                  )
-                END as reply_kind,
-                CASE
-                  WHEN inserted.id IS NULL THEN (
-                    SELECT TOP 1 r.payload
-                    FROM ${repliesTableSql} r
-                    WHERE r.id = target.last_reply_id
-                  )
-                END as reply_payload,
-                CASE
-                  WHEN inserted.id IS NULL THEN (
-                    SELECT TOP 1 r.sequence
-                    FROM ${repliesTableSql} r
-                    WHERE r.id = target.last_reply_id
-                  )
-                END as reply_sequence;
-              `,
-          orElse: () =>
-            sql`
-              SELECT m.id, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
-              FROM ${messagesTableSql} m
-              LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
-              WHERE m.message_id = ${message_id}
-            `.pipe(
-              Effect.tap(sql`INSERT OR IGNORE INTO ${messagesTableSql} ${sql.insert(row)}`),
-              sql.withTransaction
-            )
-        })
+        let insert = insertEnvelope(row, message_id)
         if (envelope._tag === "AckChunk") {
           insert = insert.pipe(
             Effect.tap(sql`UPDATE ${repliesTableSql} SET acked = ${sqlTrue} WHERE id = ${envelope.replyId}`),
