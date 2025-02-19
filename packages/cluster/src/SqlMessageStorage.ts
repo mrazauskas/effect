@@ -24,11 +24,9 @@ import * as Snowflake from "./Snowflake.js"
  */
 export const makeSql = Effect.fnUntraced(function*(options?: {
   readonly prefix?: string | undefined
-  readonly replyPollInterval?: DurationInput | undefined
 }) {
   const sql = (yield* SqlClient.SqlClient).withoutTransforms()
   const prefix = options?.prefix ?? "cluster"
-  const replyPollInterval = options?.replyPollInterval ?? 5000
   const table = (name: string) => `${prefix}_${name}`
 
   const messagesTable = table("messages")
@@ -100,7 +98,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
           reply_id BIGINT,
           CONSTRAINT ${sql(messagesTable + "_id")} UNIQUE (message_id)
         )
-      `,
+      `.pipe(Effect.ignore),
     orElse: () =>
       // sqlite
       sql`
@@ -155,7 +153,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
 
         CREATE INDEX IF NOT EXISTS ${sql(idLookupIndex)}
         ON ${sql(messagesTable)} (id, processed, sequence);
-      `,
+      `.unprepared.pipe(Effect.ignore),
     orElse: () =>
       // sqlite
       Effect.andThen(
@@ -177,7 +175,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
       sql`
         IF OBJECT_ID(N'${sql(repliesTable)}', N'U') IS NULL
         CREATE TABLE ${sql(repliesTable)} (
-          id BIGINT IDENTITY(1,1) PRIMARY KEY,
+          id BIGINT NOT NULL,
           kind INT NOT NULL,
           request_id BIGINT NOT NULL,
           payload TEXT NOT NULL,
@@ -187,7 +185,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
     mysql: () =>
       sql`
         CREATE TABLE IF NOT EXISTS ${sql(repliesTable)} (
-          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          id BIGINT PRIMARY KEY,
           kind INT NOT NULL,
           request_id BIGINT NOT NULL,
           payload TEXT NOT NULL,
@@ -197,7 +195,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
     pg: () =>
       sql`
         CREATE TABLE IF NOT EXISTS ${sql(repliesTable)} (
-          id BIGSERIAL PRIMARY KEY,
+          id BIGINT PRIMARY KEY,
           kind INT NOT NULL,
           request_id BIGINT NOT NULL,
           payload TEXT NOT NULL,
@@ -208,7 +206,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
       // sqlite
       sql`
         CREATE TABLE IF NOT EXISTS ${sql(repliesTable)} (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          id INTEGER PRIMARY KEY,
           kind INTEGER NOT NULL,
           request_id INTEGER NOT NULL,
           payload TEXT NOT NULL,
@@ -230,7 +228,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
       sql`
         CREATE INDEX ${sql(replyLookupIndex)}
         ON ${sql(repliesTable)} (request_id, id);
-      `.pipe(Effect.ignore),
+      `.unprepared.pipe(Effect.ignore),
     pg: () =>
       sql`
         CREATE INDEX IF NOT EXISTS ${sql(replyLookupIndex)}
@@ -318,14 +316,14 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
     readonly envelope: Envelope.Envelope.Encoded
     readonly lastSentReply: Option.Option<Reply.ReplyEncoded<any>>
   } => {
-    switch (row.kind) {
+    switch (Number(row.kind) as 0 | 1 | 2) {
       case 0:
         return {
           envelope: {
             _tag: "Request",
             requestId: String(row.id),
             address: {
-              shardId: row.shard_id,
+              shardId: Number(row.shard_id),
               entityType: row.entity_type,
               entityId: row.entity_id
             },
@@ -353,7 +351,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
             requestId: String(row.request_id!),
             replyId: String(row.reply_id!),
             address: {
-              shardId: row.shard_id,
+              shardId: Number(row.shard_id),
               entityType: row.entity_type,
               entityId: row.entity_id
             }
@@ -367,7 +365,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
             id: String(row.id),
             requestId: String(row.request_id!),
             address: {
-              shardId: row.shard_id,
+              shardId: Number(row.shard_id),
               entityType: row.entity_type,
               entityId: row.entity_id
             }
@@ -495,7 +493,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
                   ...(row.reply_kind === replyKind.WithExit
                     ? { exit: JSON.parse(row.reply_payload as string) }
                     : {
-                      sequence: row.reply_sequence,
+                      sequence: Number(row.reply_sequence),
                       values: JSON.parse(row.reply_payload as string)
                     })
                 } as any) :
@@ -504,6 +502,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
           })
         )
       }).pipe(
+        Effect.provideService(SqlClient.SafeIntegers, true),
         Effect.catchAllCause((cause) => Effect.fail(new MessagePersistenceError({ cause: Cause.squash(cause) })))
       ),
 
@@ -522,36 +521,43 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
         Effect.catchAllCause((cause) => Effect.fail(new MessagePersistenceError({ cause: Cause.squash(cause) })))
       ),
 
-    repliesAfter: Effect.fnUntraced(function*(lastReceivedReply, limit) {
-      const query = sql<ReplyRow>`
+    repliesFor: (requestIds) =>
+      // replies where:
+      // - the request is in the list
+      // - the kind is WithExit
+      // - or the kind is Chunk and has not been acked yet
+      sql<ReplyRow>`
         SELECT id, kind, request_id, payload, sequence
         FROM ${sql(repliesTable)}
-        WHERE request_id = ${lastReceivedReply.requestId}
-        AND id > ${lastReceivedReply.id}
+        WHERE ${sql.in("request_id", requestIds)}
+        AND (
+          kind = ${sql.literal(String(replyKind.WithExit))}
+          OR (
+            kind = ${sql.literal(String(replyKind.Chunk))}
+            AND id NOT IN (SELECT reply_id FROM ${sql(messagesTable)})
+          )
+        )
         ORDER BY id ASC
-        LIMIT ${sql.literal(String(limit))}
-      `
-      let result = yield* query
-      while (!Arr.isNonEmptyReadonlyArray(result)) {
-        yield* Effect.sleep(replyPollInterval)
-        result = yield* query
-      }
-      return Arr.map(result, (row): Reply.ReplyEncoded<any> =>
-        row.kind === replyKind.WithExit ?
-          ({
-            _tag: "WithExit",
-            id: String(row.id),
-            requestId: String(row.request_id),
-            exit: JSON.parse(row.payload)
-          }) :
-          {
-            _tag: "Chunk",
-            id: String(row.id),
-            requestId: String(row.request_id),
-            values: JSON.parse(row.payload),
-            sequence: row.sequence!
-          })
-    }, Effect.catchAllCause((cause) => Effect.fail(new MessagePersistenceError({ cause: Cause.squash(cause) })))),
+      `.pipe(
+        Effect.provideService(SqlClient.SafeIntegers, true),
+        Effect.map(Arr.map((row): Reply.ReplyEncoded<any> =>
+          row.kind === replyKind.WithExit ?
+            ({
+              _tag: "WithExit",
+              id: String(row.id),
+              requestId: String(row.request_id),
+              exit: JSON.parse(row.payload)
+            }) :
+            {
+              _tag: "Chunk",
+              id: String(row.id),
+              requestId: String(row.request_id),
+              values: JSON.parse(row.payload),
+              sequence: Number(row.sequence!)
+            }
+        )),
+        Effect.catchAllCause((cause) => Effect.fail(new MessagePersistenceError({ cause: Cause.squash(cause) })))
+      ),
 
     unprocessedMessages: Effect.fnUntraced(
       function*(options) {
@@ -601,17 +607,19 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
         let maxSequence = cursor
         if (newShardsRows) {
           for (const row of newShardsRows) {
+            const sequence = Number(row.sequence)
             messages.push(messageFromRow(row))
-            if (row.sequence > maxSequence) {
-              maxSequence = row.sequence
+            if (sequence > maxSequence) {
+              maxSequence = sequence
             }
           }
         }
         if (existingShardsRows) {
           for (const row of existingShardsRows) {
+            const sequence = Number(row.sequence)
             messages.push(messageFromRow(row))
-            if (row.sequence > maxSequence) {
-              maxSequence = row.sequence
+            if (sequence > maxSequence) {
+              maxSequence = sequence
             }
           }
         }
@@ -620,6 +628,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
       },
       (effect, { existingShards, newShards }) =>
         existingShards.length && newShards.length ? sql.withTransaction(effect) : effect,
+      Effect.provideService(SqlClient.SafeIntegers, true),
       Effect.catchAllCause((cause) => Effect.fail(new MessagePersistenceError({ cause: Cause.squash(cause) })))
     ),
 
@@ -632,6 +641,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
         LEFT JOIN (${latestReplies}) r ON r.request_id = m.id
       `.pipe(
         Effect.map(Arr.map(messageFromRow)),
+        Effect.provideService(SqlClient.SafeIntegers, true),
         Effect.catchAllCause((cause) => Effect.fail(new MessagePersistenceError({ cause: Cause.squash(cause) })))
       )
     }
@@ -680,34 +690,34 @@ const replyKind = {
 type MessageRow = {
   readonly id: string | bigint
   readonly message_id: string
-  readonly shard_id: number
+  readonly shard_id: number | bigint
   readonly entity_type: string
   readonly entity_id: string
-  readonly kind: 0 | 1 | 2
+  readonly kind: 0 | 1 | 2 | 0n | 1n | 2n
   readonly tag: string | null
   readonly payload: string | null
   readonly headers: string | null
   readonly trace_id: string | null
   readonly span_id: string | null
-  readonly sampled: boolean | number | null
+  readonly sampled: boolean | number | bigint | null
   readonly request_id: string | bigint | null
   readonly reply_id: string | bigint | null
 }
 
 type ReplyRow = {
   readonly id: string | bigint
-  readonly kind: 0 | 1
+  readonly kind: 0 | 1 | 0n | 1n
   readonly request_id: string | bigint
   readonly payload: string
-  readonly sequence: number | null
+  readonly sequence: number | bigint | null
 }
 
 type ReplyJoinRow = {
   readonly reply_id: string | bigint | null
   readonly reply_payload: string | null
-  readonly reply_sequence: number | null
+  readonly reply_sequence: number | bigint | null
 }
 
 type MessageJoinRow = MessageRow & ReplyJoinRow & {
-  readonly sequence: number
+  readonly sequence: number | bigint
 }

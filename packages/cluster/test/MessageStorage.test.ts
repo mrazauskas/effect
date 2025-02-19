@@ -13,7 +13,7 @@ import {
 import { Headers } from "@effect/platform"
 import { Rpc } from "@effect/rpc"
 import { describe, expect, it } from "@effect/vitest"
-import { Context, Effect, Exit, Fiber, Layer, Option, PrimaryKey, Schema, TestClock } from "effect"
+import { Context, Effect, Exit, Layer, Option, PrimaryKey, Schema } from "effect"
 
 const MemoryLive = MessageStorage.layerMemory.pipe(
   Layer.provideMerge(Snowflake.layerGenerator),
@@ -76,18 +76,15 @@ describe("MessageStorage", () => {
         expect(messages).toHaveLength(0)
       }).pipe(Effect.provide(MemoryLive)))
 
-    it.effect("repliesAfter", () =>
+    it.effect("repliesFor", () =>
       Effect.gen(function*() {
         const storage = yield* MessageStorage.MessageStorage
         const request = yield* makeRequest()
         yield* storage.saveRequest(request)
-        const fiber = yield* storage.repliesAfter(makeEmptyReply(request), 4).pipe(
-          Effect.fork
-        )
-        yield* TestClock.adjust(1000)
-        expect(fiber.unsafePoll()).toBeNull()
+        let replies = yield* storage.repliesFor([request])
+        expect(replies).toHaveLength(0)
         yield* storage.saveReply(yield* makeReply(request))
-        const replies = yield* Fiber.join(fiber)
+        replies = yield* storage.repliesFor([request])
         expect(replies).toHaveLength(1)
         expect(replies[0].requestId).toEqual(request.envelope.requestId)
       }).pipe(Effect.provide(MemoryLive)))

@@ -2,15 +2,17 @@
  * @since 1.0.0
  */
 import type * as Rpc from "@effect/rpc/Rpc"
-import type { NonEmptyArray } from "effect/Array"
 import * as Arr from "effect/Array"
 import * as Context from "effect/Context"
 import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
+import * as FiberRef from "effect/FiberRef"
 import { globalValue } from "effect/GlobalValue"
 import * as Iterable from "effect/Iterable"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import type { ParseError } from "effect/ParseResult"
 import type { Predicate } from "effect/Predicate"
 import * as Schema from "effect/Schema"
 import type { Scope } from "effect/Scope"
@@ -50,15 +52,14 @@ export class MessageStorage extends Context.Tag("@effect/cluster/MessageStorage"
   ) => Effect.Effect<void, MessagePersistenceError | MalformedMessage>
 
   /**
-   * Retrieves the replies received after the specified `Reply`.
+   * Retrieves the replies for the specified requests.
    *
-   * The MessageStorage implementation will suspend until replies are
-   * available.
+   * - Un-acknowledged chunk replies
+   * - WithExit replies
    */
-  readonly repliesAfter: <R extends Rpc.Any>(
-    lastReceivedReply: Reply.ReplyWithContext<R>,
-    max: number
-  ) => Effect.Effect<NonEmptyArray<Reply.Reply<R>>, MessagePersistenceError | MalformedMessage>
+  readonly repliesFor: <R extends Rpc.Any>(
+    requests: Iterable<Message.OutgoingRequest<R>>
+  ) => Effect.Effect<Array<Reply.Reply<R>>, MessagePersistenceError | MalformedMessage>
 
   /**
    * For locally sent messages, register a handler to process the replies.
@@ -171,15 +172,15 @@ export type Encoded = {
   ) => Effect.Effect<void, MessagePersistenceError>
 
   /**
-   * Retrieves the replies received after the specified `Reply`.
+   * Retrieves the replies for the specified requests.
    *
-   * The MessageStorage implementation will suspend until replies are
-   * available.
+   * - Un-acknowledged chunk replies
+   * - WithExit replies
    */
-  readonly repliesAfter: (
-    lastReceivedReply: Reply.Reply<any>,
-    max: number
-  ) => Effect.Effect<NonEmptyArray<Reply.ReplyEncoded<any>>, MessagePersistenceError>
+  readonly repliesFor: (requestIds: Array<string>) => Effect.Effect<
+    Array<Reply.ReplyEncoded<any>>,
+    MessagePersistenceError
+  >
 
   /**
    * Retrieves the unprocessed messages for the given options.
@@ -227,6 +228,16 @@ export type Encoded = {
 export type EncodedUnprocessedOptions<A> = {
   readonly existingShards: Array<number>
   readonly newShards: Array<number>
+  readonly cursor: Option.Option<A>
+}
+
+/**
+ * @since 1.0.0
+ * @category Encoded
+ */
+export type EncodedRepliesOptions<A> = {
+  readonly existingRequests: Array<string>
+  readonly newRequests: Array<string>
   readonly cursor: Option.Option<A>
 }
 
@@ -286,7 +297,7 @@ export const makeEncoded: (encoded: Encoded) => Effect.Effect<
           const duplicate = result
           const schema = Reply.Reply(message.rpc)
           return Schema.decode(schema)(result.lastReceivedReply.value).pipe(
-            Effect.provide(message.context),
+            Effect.locally(FiberRef.currentContext, message.context),
             MalformedMessage.refail,
             Effect.map((reply) =>
               SaveResult.Duplicate({
@@ -303,17 +314,17 @@ export const makeEncoded: (encoded: Encoded) => Effect.Effect<
         Effect.asVoid
       ),
     saveReply: (reply) => Effect.flatMap(Reply.serialize(reply), encoded.saveReply),
-    repliesAfter(lastReceivedReply, max) {
-      const schema = Schema.mutable(Schema.NonEmptyArray(Reply.Reply(lastReceivedReply.rpc)))
-      return encoded.repliesAfter(lastReceivedReply.reply, max).pipe(
-        Effect.flatMap((replies) =>
-          Schema.decode(schema)(replies).pipe(
-            Effect.provide(lastReceivedReply.context),
-            MalformedMessage.refail
-          )
-        )
-      )
-    },
+    repliesFor: Effect.fnUntraced(function*(messages) {
+      const requestIds = Arr.empty<string>()
+      const map = new Map<string, Message.OutgoingRequest<any>>()
+      for (const message of messages) {
+        const id = String(message.envelope.requestId)
+        requestIds.push(id)
+        map.set(id, message)
+      }
+      const encodedReplies = yield* encoded.repliesFor(requestIds)
+      return yield* decodeReplies(map, encodedReplies)
+    }),
     unprocessedMessages: Effect.fnUntraced(function*(shardIds, sessionKey) {
       const meta = cursors.get(sessionKey)
       if (!meta) {
@@ -372,7 +383,11 @@ export const makeEncoded: (encoded: Encoded) => Effect.Effect<
     // if we have a malformed message, we should not return it and update
     // the storage with a defect
     const decodeMessage = Effect.catchAll(
-      Effect.suspend(() => decodeEnvelopeWithReply(envelopes[index])),
+      Effect.suspend(() => {
+        const envelope = envelopes[index]
+        if (!envelope) return Effect.succeed(undefined)
+        return decodeEnvelopeWithReply(envelope)
+      }),
       (error) => {
         const envelope = envelopes[index]
         return storage.saveReply(Reply.ReplyWithContext.fromDefect({
@@ -410,6 +425,50 @@ export const makeEncoded: (encoded: Encoded) => Effect.Effect<
     )
   }
 
+  const decodeReplies = (
+    messages: Map<string, Message.OutgoingRequest<any>>,
+    encodedReplies: Array<Reply.ReplyEncoded<any>>
+  ) => {
+    const replies: Array<Reply.Reply<any>> = []
+    const ignoredRequests = new Set<string>()
+    let index = 0
+
+    const decodeReply: Effect.Effect<void | Reply.Reply<any>> = Effect.catchAll(
+      Effect.suspend(() => {
+        const reply = encodedReplies[index]
+        if (ignoredRequests.has(reply.requestId)) return Effect.void
+        const message = messages.get(reply.requestId)
+        if (!message) return Effect.void
+        const schema = Reply.Reply(message.rpc)
+        return Schema.decode(schema)(reply).pipe(
+          Effect.locally(FiberRef.currentContext, message.context)
+        ) as Effect.Effect<Reply.Reply<any>, ParseError>
+      }),
+      (error) => {
+        const reply = encodedReplies[index]
+        ignoredRequests.add(reply.requestId)
+        return Effect.succeed(
+          new Reply.WithExit({
+            id: snowflakeGen.unsafeNext(),
+            requestId: Snowflake.Snowflake(reply.requestId),
+            exit: Exit.die(error)
+          })
+        )
+      }
+    )
+    return Effect.as(
+      Effect.whileLoop({
+        while: () => index < encodedReplies.length,
+        body: () => decodeReply,
+        step: (reply) => {
+          index++
+          if (reply) replies.push(reply)
+        }
+      }),
+      replies
+    )
+  }
+
   return storage
 })
 
@@ -424,7 +483,7 @@ export const noop: MessageStorage["Type"] = globalValue(
       saveRequest: () => Effect.succeed(SaveResult.Success()),
       saveEnvelope: () => Effect.void,
       saveReply: () => Effect.void,
-      repliesAfter: () => Effect.never,
+      repliesFor: () => Effect.succeed([]),
       unprocessedMessages: () => Effect.succeed([]),
       unprocessedMessagesById: () => Effect.succeed([])
     }))
@@ -436,7 +495,7 @@ export const noop: MessageStorage["Type"] = globalValue(
  */
 export type MemoryEntry = {
   readonly envelope: Envelope.Request.Encoded
-  lastReceivedReply: Option.Option<Reply.ReplyEncoded<any>>
+  lastReceivedChunk: Option.Option<Reply.ChunkEncoded<any>>
   replies: Array<Reply.ReplyEncoded<any>>
 }
 
@@ -490,18 +549,21 @@ export class MemoryDriver extends Effect.Service<MemoryDriver>()("@effect/cluste
           if (existing) {
             return SaveResultEncoded.Duplicate({
               originalId: Snowflake.Snowflake(existing.envelope.requestId),
-              lastReceivedReply: existing.lastReceivedReply
+              lastReceivedReply: existing.lastReceivedChunk
             })
           }
           if (envelope._tag === "Request") {
-            const entry: MemoryEntry = { envelope, replies: [], lastReceivedReply: Option.none() }
+            const entry: MemoryEntry = { envelope, replies: [], lastReceivedChunk: Option.none() }
             requests.set(envelope.requestId, entry)
             requestsByPrimaryKey.set(primaryKey, entry)
             unprocessed.add(envelope)
           } else if (envelope._tag === "AckChunk") {
             const entry = requests.get(envelope.requestId)
             if (entry) {
-              entry.lastReceivedReply = Arr.findFirst(entry.replies, (r) => r.id === envelope.replyId)
+              entry.lastReceivedChunk = Arr.findFirst(
+                entry.replies,
+                (r): r is Reply.ChunkEncoded<any> => r._tag === "Chunk" && r.id === envelope.replyId
+              ).pipe(Option.orElse(() => entry.lastReceivedChunk))
             }
           }
           journal.push(envelope)
@@ -518,21 +580,26 @@ export class MemoryDriver extends Effect.Service<MemoryDriver>()("@effect/cluste
           replyIds.add(reply.id)
           replyLatch.unsafeOpen()
         }),
-      repliesAfter: (reply, n) =>
-        Effect.suspend(function loop(): Effect.Effect<NonEmptyArray<Reply.ReplyEncoded<any>>> {
-          const replyId = String(reply.id)
-          const entry = requests.get(String(reply.requestId))
-          if (!entry) {
-            replyLatch.unsafeClose()
-            return Effect.flatMap(replyLatch.await, loop)
+      repliesFor: (requestIds) =>
+        Effect.sync(() => {
+          const replies = Arr.empty<Reply.ReplyEncoded<any>>()
+          for (const requestId of requestIds) {
+            const request = requests.get(requestId)
+            if (!request) continue
+            else if (Option.isNone(request.lastReceivedChunk)) {
+              // eslint-disable-next-line no-restricted-syntax
+              replies.push(...request.replies)
+              continue
+            }
+            const sequence = request.lastReceivedChunk.value.sequence
+            for (const reply of request.replies) {
+              if (reply._tag === "Chunk" && reply.sequence <= sequence) {
+                continue
+              }
+              replies.push(reply)
+            }
           }
-          const index = entry.replies.findIndex((r) => r.id === replyId)
-          const replies = entry.replies.slice(index + 1, index + 1 + n)
-          if (!Arr.isNonEmptyArray(replies)) {
-            replyLatch.unsafeClose()
-            return Effect.flatMap(replyLatch.await, loop)
-          }
-          return Effect.succeed(replies)
+          return replies
         }),
       unprocessedMessages: ({ cursor, existingShards, newShards }: EncodedUnprocessedOptions<number>) =>
         Effect.sync(() => {

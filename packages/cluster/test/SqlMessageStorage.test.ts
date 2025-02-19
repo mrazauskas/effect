@@ -5,17 +5,10 @@ import { Rpc } from "@effect/rpc"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { SqlClient } from "@effect/sql/SqlClient"
 import { describe, expect, it } from "@effect/vitest"
-import { Effect, Fiber, Layer, TestClock } from "effect"
+import { Effect, Layer } from "effect"
 import { MysqlContainer } from "../../sql-mysql2/test/utils.js"
 import { PgContainer } from "../../sql-pg/test/utils.js"
-import {
-  makeChunkReply,
-  makeEmptyReply,
-  makeReply,
-  makeRequest,
-  PrimaryKeyTest,
-  StreamRpc
-} from "./MessageStorage.test.js"
+import { makeChunkReply, makeReply, makeRequest, PrimaryKeyTest, StreamRpc } from "./MessageStorage.test.js"
 
 const StorageLive = SqlMessageStorage.layer.pipe(
   Layer.provideMerge(Snowflake.layerGenerator),
@@ -119,23 +112,17 @@ describe("SqlMessageStorage", () => {
           expect(messages).toHaveLength(0)
         }))
 
-      it.effect("repliesAfter", () =>
+      it.effect("repliesFor", () =>
         Effect.gen(function*() {
           yield* truncate
-
-          yield* TestClock.setTime(Date.now())
 
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
           yield* storage.saveRequest(request)
-          const fiber = yield* storage.repliesAfter(makeEmptyReply(request), 4).pipe(
-            Effect.fork
-          )
-          yield* TestClock.adjust(5000)
-          expect(fiber.unsafePoll()).toBeNull()
+          let replies = yield* storage.repliesFor([request])
+          expect(replies).toHaveLength(0)
           yield* storage.saveReply(yield* makeReply(request))
-          yield* TestClock.adjust(5000)
-          const replies = yield* Fiber.join(fiber)
+          replies = yield* storage.repliesFor([request])
           expect(replies).toHaveLength(1)
           expect(replies[0].requestId).toEqual(request.envelope.requestId)
         }))

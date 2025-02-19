@@ -395,6 +395,10 @@ describe.concurrent("Sharding", () => {
         yield* TestClock.adjust(5000) // let the shards get assigned and storage poll
         const makeClient = yield* TestEntity.client
         const client = makeClient("1")
+
+        // let the reply loop run
+        yield* TestClock.adjust(500).pipe(Effect.fork)
+
         const results = Chunk.toReadonlyArray(
           yield* Stream.runCollect(client.StreamWithKey({ key: "abc" }))
         )

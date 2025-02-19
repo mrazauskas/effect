@@ -11,7 +11,6 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as FiberRef from "effect/FiberRef"
 import * as Layer from "effect/Layer"
-import * as Option from "effect/Option"
 import * as RcMap from "effect/RcMap"
 import * as Schema from "effect/Schema"
 import type { Scope } from "effect/Scope"
@@ -98,12 +97,11 @@ export class Pods extends Context.Tag("@effect/cluster/Pods")<Pods, {
 export const make: (options: Omit<Pods["Type"], "sendLocal" | "notifyLocal">) => Effect.Effect<
   Pods["Type"],
   never,
-  MessageStorage.MessageStorage | Snowflake.Generator
+  MessageStorage.MessageStorage | Snowflake.Generator | Scope
 > = Effect.fnUntraced(function*(options: Omit<Pods["Type"], "sendLocal" | "notifyLocal">) {
   const storage = yield* MessageStorage.MessageStorage
   const snowflakeGen = yield* Snowflake.Generator
 
-  const storageReplyAcks = new Map<Snowflake.Snowflake, Effect.Latch>()
   const requestIdRewrites = new Map<Snowflake.Snowflake, Snowflake.Snowflake>()
 
   function notifyWith<E>(
@@ -119,7 +117,7 @@ export const make: (options: Omit<Pods["Type"], "sendLocal" | "notifyLocal">) =>
     if (message._tag === "OutgoingEnvelope") {
       const rewriteId = requestIdRewrites.get(message.envelope.requestId)
       const requestId = rewriteId ?? message.envelope.requestId
-      const latch = storageReplyAcks.get(requestId)
+      const entry = storageRequests.get(requestId)
       if (rewriteId) {
         message = new Message.OutgoingEnvelope({
           ...message,
@@ -129,7 +127,7 @@ export const make: (options: Omit<Pods["Type"], "sendLocal" | "notifyLocal">) =>
       return storage.saveEnvelope(message).pipe(
         Effect.orDie,
         Effect.zipRight(
-          latch ? Effect.zipRight(latch.open, afterPersist(message, false)) : afterPersist(message, false)
+          entry ? Effect.zipRight(entry.latch.open, afterPersist(message, false)) : afterPersist(message, false)
         )
       )
     }
@@ -167,60 +165,102 @@ export const make: (options: Omit<Pods["Type"], "sendLocal" | "notifyLocal">) =>
     )
   }
 
+  type StorageRequestEntry = {
+    readonly latch: Effect.Latch
+    replies: Array<Reply.Reply<any>>
+  }
+  const storageRequests = new Map<Snowflake.Snowflake, StorageRequestEntry>()
+  const waitingStorageRequests = new Map<Snowflake.Snowflake, Message.OutgoingRequest<any>>()
   const replyFromStorage = Effect.fnUntraced(
     function*(message: Message.OutgoingRequest<any>) {
-      let reply = new Reply.ReplyWithContext({
-        reply: message.lastReceivedReply.pipe(
-          Option.getOrElse(() => Reply.Chunk.emptyFrom(message.envelope.requestId))
-        ),
-        context: message.context,
-        rpc: message.rpc
-      })
-
-      if (reply.reply._tag === "WithExit") {
-        return yield* message.respond(reply.reply)
+      const entry: StorageRequestEntry = {
+        latch: Effect.unsafeMakeLatch(false),
+        replies: []
       }
+      storageRequests.set(message.envelope.requestId, entry)
 
       while (true) {
-        const replies = yield* storage.repliesAfter(reply, 4)
+        // wait for the storage loop to notify us
+        entry.latch.unsafeClose()
+        waitingStorageRequests.set(message.envelope.requestId, message)
+        yield* storageLatch.open
+        yield* entry.latch.await
 
-        for (const reply of replies) {
+        // send the replies back
+        for (const reply of entry.replies) {
           // we have reached the end
           if (reply._tag === "WithExit") {
-            storageReplyAcks.delete(reply.requestId)
             return yield* message.respond(reply)
           }
 
-          let latch = storageReplyAcks.get(reply.requestId)
-          if (!latch) {
-            latch = Effect.unsafeMakeLatch(false)
-            storageReplyAcks.set(reply.requestId, latch)
-          } else {
-            latch.unsafeClose()
-          }
-
+          entry.latch.unsafeClose()
           yield* message.respond(reply)
-
-          // wait for ack
-          yield* latch.await
+          yield* entry.latch.await
         }
-
-        // continue from the last received reply
-        reply = new Reply.ReplyWithContext({
-          reply: replies[replies.length - 1],
-          context: message.context,
-          rpc: message.rpc
-        })
+        entry.replies = []
       }
     },
     (effect, message) =>
       Effect.ensuring(
         effect,
         Effect.sync(() => {
-          storageReplyAcks.delete(message.envelope.requestId)
+          storageRequests.delete(message.envelope.requestId)
+          waitingStorageRequests.delete(message.envelope.requestId)
         })
       )
   )
+
+  const storageLatch = Effect.unsafeMakeLatch(false)
+  if (storage !== MessageStorage.noop) {
+    yield* Effect.gen(function*() {
+      while (true) {
+        yield* storageLatch.await
+        storageLatch.unsafeClose()
+
+        const replies = yield* storage.repliesFor(waitingStorageRequests.values()).pipe(
+          Effect.catchAllCause((cause) =>
+            Effect.as(
+              Effect.annotateLogs(Effect.logDebug(cause), {
+                package: "@effect/cluster",
+                module: "Pods",
+                fiber: "Read replies loop"
+              }),
+              []
+            )
+          )
+        )
+
+        const foundRequests = new Set<StorageRequestEntry>()
+
+        // put the replies into the storage requests and then open the latches
+        for (const reply of replies) {
+          const entry = storageRequests.get(reply.requestId)
+          if (!entry) continue
+          entry.replies.push(reply)
+          waitingStorageRequests.delete(reply.requestId)
+          foundRequests.add(entry)
+        }
+
+        for (const entry of foundRequests) {
+          entry.latch.unsafeOpen()
+        }
+      }
+    }).pipe(
+      Effect.interruptible,
+      Effect.forkScoped
+    )
+
+    yield* Effect.sync(() => {
+      if (waitingStorageRequests.size > 0) {
+        storageLatch.unsafeOpen()
+      }
+    }).pipe(
+      Effect.delay(500),
+      Effect.forever,
+      Effect.interruptible,
+      Effect.forkScoped
+    )
+  }
 
   return Pods.of({
     ...options,
@@ -283,7 +323,7 @@ export const make: (options: Omit<Pods["Type"], "sendLocal" | "notifyLocal">) =>
 export const makeNoop: Effect.Effect<
   Pods["Type"],
   never,
-  MessageStorage.MessageStorage | Snowflake.Generator
+  MessageStorage.MessageStorage | Snowflake.Generator | Scope
 > = make({
   send: ({ message }) => Effect.fail(new EntityNotManagedByPod({ address: message.envelope.address })),
   notify: () => Effect.void,
@@ -298,7 +338,7 @@ export const layerNoop: Layer.Layer<
   Pods,
   never,
   ShardingConfig | MessageStorage.MessageStorage
-> = Layer.effect(Pods, makeNoop).pipe(Layer.provide([Snowflake.layerGenerator]))
+> = Layer.scoped(Pods, makeNoop).pipe(Layer.provide([Snowflake.layerGenerator]))
 
 const rpcErrors: Schema.Union<[
   typeof EntityNotManagedByPod,
