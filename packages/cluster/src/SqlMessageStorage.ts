@@ -4,6 +4,7 @@
 import * as SqlClient from "@effect/sql/SqlClient"
 import type { Row } from "@effect/sql/SqlConnection"
 import type { SqlError } from "@effect/sql/SqlError"
+import type { Statement } from "@effect/sql/Statement"
 import * as Arr from "effect/Array"
 import * as Cause from "effect/Cause"
 import type { DurationInput } from "effect/Duration"
@@ -30,12 +31,13 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
   const table = (name: string) => `${prefix}_${name}`
 
   const messagesTable = table("messages")
+  const messagesTableSql = sql(messagesTable)
 
   yield* sql.onDialectOrElse({
     mssql: () =>
       sql`
-        IF OBJECT_ID(N'${sql(messagesTable)}', N'U') IS NULL
-        CREATE TABLE ${sql(messagesTable)} (
+        IF OBJECT_ID(N'${messagesTableSql}', N'U') IS NULL
+        CREATE TABLE ${messagesTableSql} (
           sequence BIGINT IDENTITY(1,1) PRIMARY KEY,
           id BIGINT NOT NULL,
           message_id VARCHAR(255) NOT NULL,
@@ -57,7 +59,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
       `,
     mysql: () =>
       sql`
-        CREATE TABLE IF NOT EXISTS ${sql(messagesTable)} (
+        CREATE TABLE IF NOT EXISTS ${messagesTableSql} (
           sequence BIGINT AUTO_INCREMENT PRIMARY KEY,
           id BIGINT NOT NULL,
           message_id VARCHAR(255) NOT NULL,
@@ -79,7 +81,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
       `,
     pg: () =>
       sql`
-        CREATE TABLE IF NOT EXISTS ${sql(messagesTable)} (
+        CREATE TABLE IF NOT EXISTS ${messagesTableSql} (
           sequence BIGSERIAL PRIMARY KEY,
           id BIGINT NOT NULL,
           message_id VARCHAR(255) NOT NULL,
@@ -102,7 +104,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
     orElse: () =>
       // sqlite
       sql`
-        CREATE TABLE IF NOT EXISTS ${sql(messagesTable)} (
+        CREATE TABLE IF NOT EXISTS ${messagesTableSql} (
           sequence INTEGER PRIMARY KEY AUTOINCREMENT,
           id INTEGER NOT NULL,
           message_id TEXT NOT NULL,
@@ -132,85 +134,90 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
       sql`
         IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = ${shardLookupIndex})
         CREATE INDEX ${sql(shardLookupIndex)} 
-        ON ${sql(messagesTable)} (shard_id, kind, processed, sequence);
+        ON ${messagesTableSql} (shard_id, kind, processed, sequence);
 
         IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = ${idLookupIndex})
         CREATE INDEX ${sql(idLookupIndex)}
-        ON ${sql(messagesTable)} (id, processed, sequence);
+        ON ${messagesTableSql} (id, processed, sequence);
       `,
     mysql: () =>
       sql`
         CREATE INDEX ${sql(shardLookupIndex)}
-        ON ${sql(messagesTable)} (shard_id, kind, processed, sequence);
+        ON ${messagesTableSql} (shard_id, kind, processed, sequence);
 
         CREATE INDEX ${sql(idLookupIndex)}
-        ON ${sql(messagesTable)} (id, processed, sequence);
+        ON ${messagesTableSql} (id, processed, sequence);
       `.unprepared.pipe(Effect.ignore),
     pg: () =>
       sql`
         CREATE INDEX IF NOT EXISTS ${sql(shardLookupIndex)}
-        ON ${sql(messagesTable)} (shard_id, kind, processed, sequence);
+        ON ${messagesTableSql} (shard_id, kind, processed, sequence);
 
         CREATE INDEX IF NOT EXISTS ${sql(idLookupIndex)}
-        ON ${sql(messagesTable)} (id, processed, sequence);
+        ON ${messagesTableSql} (id, processed, sequence);
       `.unprepared.pipe(Effect.ignore),
     orElse: () =>
       // sqlite
       Effect.andThen(
         sql`
           CREATE INDEX IF NOT EXISTS ${sql(shardLookupIndex)}
-          ON ${sql(messagesTable)} (shard_id, kind, processed, sequence)
+          ON ${messagesTableSql} (shard_id, kind, processed, sequence)
         `,
         sql`
           CREATE INDEX IF NOT EXISTS ${sql(idLookupIndex)}
-          ON ${sql(messagesTable)} (id, processed, sequence)
+          ON ${messagesTableSql} (id, processed, sequence)
         `
       )
   })
 
   const repliesTable = table("replies")
+  const repliesTableSql = sql(repliesTable)
 
   yield* sql.onDialectOrElse({
     mssql: () =>
       sql`
-        IF OBJECT_ID(N'${sql(repliesTable)}', N'U') IS NULL
-        CREATE TABLE ${sql(repliesTable)} (
+        IF OBJECT_ID(N'${repliesTableSql}', N'U') IS NULL
+        CREATE TABLE ${repliesTableSql} (
           id BIGINT NOT NULL,
           kind INT NOT NULL,
           request_id BIGINT NOT NULL,
           payload TEXT NOT NULL,
-          sequence INT
+          sequence INT,
+          acked BIT NOT NULL DEFAULT 0
         )
       `,
     mysql: () =>
       sql`
-        CREATE TABLE IF NOT EXISTS ${sql(repliesTable)} (
+        CREATE TABLE IF NOT EXISTS ${repliesTableSql} (
           id BIGINT PRIMARY KEY,
           kind INT NOT NULL,
           request_id BIGINT NOT NULL,
           payload TEXT NOT NULL,
-          sequence INT
+          sequence INT,
+          acked BOOLEAN NOT NULL DEFAULT FALSE
         )
       `,
     pg: () =>
       sql`
-        CREATE TABLE IF NOT EXISTS ${sql(repliesTable)} (
+        CREATE TABLE IF NOT EXISTS ${repliesTableSql} (
           id BIGINT PRIMARY KEY,
           kind INT NOT NULL,
           request_id BIGINT NOT NULL,
           payload TEXT NOT NULL,
-          sequence INT
+          sequence INT,
+          acked BOOLEAN NOT NULL DEFAULT FALSE
         )
       `,
     orElse: () =>
       // sqlite
       sql`
-        CREATE TABLE IF NOT EXISTS ${sql(repliesTable)} (
+        CREATE TABLE IF NOT EXISTS ${repliesTableSql} (
           id INTEGER PRIMARY KEY,
           kind INTEGER NOT NULL,
           request_id INTEGER NOT NULL,
           payload TEXT NOT NULL,
-          sequence INTEGER
+          sequence INTEGER,
+          acked BOOLEAN NOT NULL DEFAULT FALSE
         )
       `
   })
@@ -222,23 +229,23 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
       sql`
         IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = ${replyLookupIndex})
         CREATE INDEX ${sql(replyLookupIndex)}
-        ON ${sql(repliesTable)} (request_id, id);
+        ON ${repliesTableSql} (request_id, id, acked);
       `,
     mysql: () =>
       sql`
         CREATE INDEX ${sql(replyLookupIndex)}
-        ON ${sql(repliesTable)} (request_id, id);
+        ON ${repliesTableSql} (request_id, id, acked);
       `.unprepared.pipe(Effect.ignore),
     pg: () =>
       sql`
         CREATE INDEX IF NOT EXISTS ${sql(replyLookupIndex)}
-        ON ${sql(repliesTable)} (request_id, id);
+        ON ${repliesTableSql} (request_id, id, acked);
       `,
     orElse: () =>
       // sqlite
       sql`
         CREATE INDEX IF NOT EXISTS ${sql(replyLookupIndex)}
-        ON ${sql(repliesTable)} (request_id, id);
+        ON ${repliesTableSql} (request_id, id, acked);
       `
   })
 
@@ -377,10 +384,10 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
 
   const latestReplies = sql<ReplyRow>`
     SELECT id, kind, request_id, payload, sequence
-    FROM ${sql(repliesTable)}
+    FROM ${repliesTableSql}
     WHERE id IN (
       SELECT MAX(id) as id
-      FROM ${sql(repliesTable)}
+      FROM ${repliesTableSql}
       GROUP BY request_id
     )
   `
@@ -391,18 +398,17 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
     saveEnvelope: (envelope, message_id) =>
       Effect.suspend(() => {
         const row = envelopeToRow(envelope, message_id)
-        return sql.onDialectOrElse({
+        let insert = sql.onDialectOrElse({
           pg: () =>
             sql`
               WITH inserted AS (
-                INSERT INTO ${sql(messagesTable)} ${sql.insert(row)}
+                INSERT INTO ${messagesTableSql} ${sql.insert(row)}
                 ON CONFLICT (message_id) DO NOTHING
-                RETURNING id
               ),
               existing AS (
                 SELECT m.id, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
-                FROM ${sql(messagesTable)} m
-                LEFT JOIN ${sql(repliesTable)} r ON r.request_id = m.id
+                FROM ${messagesTableSql} m
+                LEFT JOIN ${repliesTableSql} r ON r.request_id = m.id
                 WHERE m.message_id = ${message_id}
                 AND NOT EXISTS (SELECT 1 FROM inserted)
                 ORDER BY r.id DESC
@@ -413,19 +419,19 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
           mysql: () =>
             sql`
               SELECT m.id, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
-              FROM ${sql(messagesTable)} m
-              LEFT JOIN ${sql(repliesTable)} r ON r.request_id = m.id
+              FROM ${messagesTableSql} m
+              LEFT JOIN ${repliesTableSql} r ON r.request_id = m.id
               WHERE m.message_id = ${message_id}
               ORDER BY r.id DESC
               LIMIT 1;
-              INSERT INTO ${sql(messagesTable)} ${sql.insert(row)}
+              INSERT INTO ${messagesTableSql} ${sql.insert(row)}
               ON DUPLICATE KEY UPDATE id = id;
 `.unprepared.pipe(
                 Effect.map(([rows]) => rows as any as ReadonlyArray<Row>)
               ),
           mssql: () =>
             sql`
-              MERGE ${sql(messagesTable)} WITH (HOLDLOCK) AS target
+              MERGE ${messagesTableSql} WITH (HOLDLOCK) AS target
               USING (SELECT ${message_id} as message_id) AS source
               ON target.message_id = source.message_id
               WHEN NOT MATCHED THEN
@@ -435,7 +441,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
                 CASE
                   WHEN inserted.id IS NULL THEN (
                     SELECT TOP 1 r.id, r.kind, r.payload
-                    FROM ${sql(repliesTable)} r
+                    FROM ${repliesTableSql} r
                     WHERE r.request_id = target.id
                     ORDER BY r.id DESC
                   )
@@ -443,7 +449,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
                 CASE
                   WHEN inserted.id IS NULL THEN (
                     SELECT TOP 1 r.kind
-                    FROM ${sql(repliesTable)} r
+                    FROM ${repliesTableSql} r
                     WHERE r.request_id = target.id
                     ORDER BY r.id DESC
                   )
@@ -451,7 +457,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
                 CASE
                   WHEN inserted.id IS NULL THEN (
                     SELECT TOP 1 r.payload
-                    FROM ${sql(repliesTable)} r
+                    FROM ${repliesTableSql} r
                     WHERE r.request_id = target.id
                     ORDER BY r.id DESC
                   )
@@ -459,7 +465,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
                 CASE
                   WHEN inserted.id IS NULL THEN (
                     SELECT TOP 1 r.sequence
-                    FROM ${sql(repliesTable)} r
+                    FROM ${repliesTableSql} r
                     WHERE r.request_id = target.id
                     ORDER BY r.id DESC
                   )
@@ -468,16 +474,23 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
           orElse: () =>
             sql`
               SELECT m.id, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
-              FROM ${sql(messagesTable)} m
-              LEFT JOIN ${sql(repliesTable)} r ON r.request_id = m.id
+              FROM ${messagesTableSql} m
+              LEFT JOIN ${repliesTableSql} r ON r.request_id = m.id
               WHERE m.message_id = ${message_id}
               ORDER BY r.id DESC
               LIMIT 1
 `.pipe(
-              Effect.tap(sql`INSERT OR IGNORE INTO ${sql(messagesTable)} ${sql.insert(row)}`),
+              Effect.tap(sql`INSERT OR IGNORE INTO ${messagesTableSql} ${sql.insert(row)}`),
               sql.withTransaction
             )
-        }).pipe(
+        })
+        if (envelope._tag === "AckChunk") {
+          insert = insert.pipe(
+            Effect.tap(sql`UPDATE ${repliesTableSql} SET acked = ${sqlTrue} WHERE id = ${envelope.replyId}`),
+            sql.withTransaction
+          )
+        }
+        return insert.pipe(
           Effect.map((rows) => {
             if (rows.length === 0) {
               return SaveResultEncoded.Success()
@@ -509,10 +522,10 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
     saveReply: (reply) =>
       Effect.suspend(() => {
         const row = replyToRow(reply)
-        const insert = sql`INSERT INTO ${sql(repliesTable)} ${sql.insert(row)}`
+        const insert = sql`INSERT INTO ${repliesTableSql} ${sql.insert(row)}`
         return reply._tag === "WithExit" ?
           insert.pipe(
-            Effect.andThen(sql`UPDATE ${sql(messagesTable)} SET processed = ${sqlTrue} WHERE id = ${reply.requestId}`),
+            Effect.andThen(sql`UPDATE ${messagesTableSql} SET processed = ${sqlTrue} WHERE id = ${reply.requestId}`),
             sql.withTransaction
           ) :
           insert
@@ -528,13 +541,13 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
       // - or the kind is Chunk and has not been acked yet
       sql<ReplyRow>`
         SELECT id, kind, request_id, payload, sequence
-        FROM ${sql(repliesTable)}
+        FROM ${repliesTableSql}
         WHERE ${sql.in("request_id", requestIds)}
         AND (
           kind = ${sql.literal(String(replyKind.WithExit))}
           OR (
             kind = ${sql.literal(String(replyKind.Chunk))}
-            AND id NOT IN (SELECT reply_id FROM ${sql(messagesTable)})
+            AND acked = ${sqlFalse}
           )
         )
         ORDER BY id ASC
@@ -566,11 +579,11 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
         const cursor = Option.getOrElse(options.cursor, () => 0)
 
         // For new shards: get unfinished requests and their interrupts
-        let newShardsRows: ReadonlyArray<MessageJoinRow> | undefined
+        const statements = Arr.empty<Statement<MessageJoinRow>>()
         if (newShards.length > 0) {
-          newShardsRows = yield* sql<MessageJoinRow>`
+          statements.push(sql<MessageJoinRow>`
             SELECT m.*, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
-            FROM ${sql(messagesTable)} m
+            FROM ${messagesTableSql} m
             LEFT JOIN (${latestReplies}) r ON r.request_id = m.id
             WHERE ${sql.in("m.shard_id", newShards)}
             AND (
@@ -578,56 +591,50 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
               (m.kind = ${sql.literal(String(messageKind.Request))} AND m.processed = ${sqlFalse})
               -- Get interrupts for unprocessed requests
               OR (m.kind = ${sql.literal(String(messageKind.Interrupt))} AND EXISTS (
-                SELECT 1 FROM ${sql(messagesTable)} m2 
+                SELECT 1 FROM ${messagesTableSql} m2 
                 WHERE m2.id = m.request_id AND m2.processed = ${sqlFalse}
               ))
             )
             ORDER BY m.sequence ASC
-          `
+          `)
         }
 
         // For existing shards: get all unprocessed messages
-        let existingShardsRows: ReadonlyArray<MessageJoinRow> | undefined
         if (existingShards.length > 0 && Option.isSome(options.cursor)) {
-          existingShardsRows = yield* sql<MessageJoinRow>`
+          statements.push(sql<MessageJoinRow>`
             SELECT m.*, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
-            FROM ${sql(messagesTable)} m
+            FROM ${messagesTableSql} m
             LEFT JOIN (${latestReplies}) r ON r.request_id = m.id
             WHERE ${sql.in("m.shard_id", existingShards)}
             AND m.processed = ${sqlFalse}
             AND m.sequence > ${cursor}
             ORDER BY m.sequence ASC
-          `
+          `)
         }
+
+        if (statements.length === 0) {
+          return [Arr.empty(), Option.some(cursor)] as const
+        }
+
+        const rows = statements.length === 1
+          ? yield* statements[0]
+          : yield* sql<MessageJoinRow>`${statements[0]} UNION ALL ${statements[1]}`
 
         const messages = Arr.empty<{
           readonly envelope: Envelope.Envelope.Encoded
           readonly lastSentReply: Option.Option<Reply.ReplyEncoded<any>>
         }>()
         let maxSequence = cursor
-        if (newShardsRows) {
-          for (const row of newShardsRows) {
-            const sequence = Number(row.sequence)
-            messages.push(messageFromRow(row))
-            if (sequence > maxSequence) {
-              maxSequence = sequence
-            }
-          }
-        }
-        if (existingShardsRows) {
-          for (const row of existingShardsRows) {
-            const sequence = Number(row.sequence)
-            messages.push(messageFromRow(row))
-            if (sequence > maxSequence) {
-              maxSequence = sequence
-            }
+        for (const row of rows) {
+          const sequence = Number(row.sequence)
+          messages.push(messageFromRow(row))
+          if (sequence > maxSequence) {
+            maxSequence = sequence
           }
         }
 
         return [messages, Option.some(maxSequence)] as const
       },
-      (effect, { existingShards, newShards }) =>
-        existingShards.length && newShards.length ? sql.withTransaction(effect) : effect,
       Effect.provideService(SqlClient.SafeIntegers, true),
       Effect.catchAllCause((cause) => Effect.fail(new MessagePersistenceError({ cause: Cause.squash(cause) })))
     ),
@@ -636,7 +643,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
       const idArr = Array.from(ids, (id) => String(id))
       return sql<MessageRow & ReplyJoinRow>`
         SELECT m.*, r.id as reply_id, r.payload as reply_payload, r.sequence as reply_sequence
-        FROM ${sql(messagesTable)} as m
+        FROM ${messagesTableSql} as m
         WHERE ${sql.in("m.id", idArr)} AND m.processed = 0
         LEFT JOIN (${latestReplies}) r ON r.request_id = m.id
       `.pipe(
