@@ -229,23 +229,23 @@ export const make = Effect.fnUntraced(function*(options?: {
       sql`
         IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = ${replyLookupIndex})
         CREATE INDEX ${sql(replyLookupIndex)}
-        ON ${repliesTableSql} (request_id, id, acked);
+        ON ${repliesTableSql} (request_id, id, kind, acked);
       `,
     mysql: () =>
       sql`
         CREATE INDEX ${sql(replyLookupIndex)}
-        ON ${repliesTableSql} (request_id, id, acked);
+        ON ${repliesTableSql} (request_id, id, kind, acked);
       `.unprepared.pipe(Effect.ignore),
     pg: () =>
       sql`
         CREATE INDEX IF NOT EXISTS ${sql(replyLookupIndex)}
-        ON ${repliesTableSql} (request_id, id, acked);
+        ON ${repliesTableSql} (request_id, id, kind, acked);
       `,
     orElse: () =>
       // sqlite
       sql`
         CREATE INDEX IF NOT EXISTS ${sql(replyLookupIndex)}
-        ON ${repliesTableSql} (request_id, id, acked);
+        ON ${repliesTableSql} (request_id, id, kind, acked);
       `
   })
 
