@@ -770,11 +770,16 @@ export const make = Effect.gen(function*() {
                 MutableHashMap.set(shardAssignments, shard, event.address)
               }
               if (isLocalPod(event.address)) {
+                let shardsAdded = false
                 for (const shardId of event.shards) {
                   if (selfShards.has(shardId)) continue
                   selfShards.add(shardId)
+                  shardsAdded = true
                 }
                 yield* Effect.forkIn(syncSingletons, shardingScope)
+                if (shardsAdded) {
+                  yield* storageLatch.open
+                }
               }
               break
             }
@@ -828,6 +833,7 @@ export const make = Effect.gen(function*() {
     const assignments = yield* shardManager.getAssignments
     yield* Effect.logDebug("Received shard assignments", assignments)
 
+    let shardsAdded = false
     for (const [shardId, pod] of assignments) {
       if (Option.isNone(pod)) {
         MutableHashMap.remove(shardAssignments, shardId)
@@ -845,9 +851,13 @@ export const make = Effect.gen(function*() {
         continue
       }
       selfShards.add(shardId)
+      shardsAdded = true
     }
 
     yield* Effect.forkIn(syncSingletons, shardingScope)
+    if (shardsAdded) {
+      yield* storageLatch.open
+    }
   })
 
   // --- Finalization ---

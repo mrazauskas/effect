@@ -8,7 +8,9 @@ import * as Context from "effect/Context"
 import type { DurationInput } from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as FiberRef from "effect/FiberRef"
 import { identity } from "effect/Function"
+import * as HashMap from "effect/HashMap"
 import * as Metric from "effect/Metric"
 import * as Option from "effect/Option"
 import * as RcMap from "effect/RcMap"
@@ -206,7 +208,7 @@ export const make = Effect.fnUntraced(function*<
       activeServers.set(address.entityId, state)
 
       return state
-    })
+    }, Effect.locally(FiberRef.currentLogAnnotations, HashMap.empty()))
   })
 
   const reaper = yield* EntityReaper
