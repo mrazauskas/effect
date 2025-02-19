@@ -177,7 +177,7 @@ export const make = Effect.fnUntraced(function*(options?: {
         ON ${messagesTableSql} (request_id);
       `.pipe(Effect.retry({
         times: 3,
-        schedule: Schedule.spaced(500)
+        schedule: Schedule.spaced(1000)
       })),
     orElse: () =>
       // sqlite
@@ -469,6 +469,10 @@ export const make = Effect.fnUntraced(function*(options?: {
         INSERT INTO ${messagesTableSql} ${sql.insert(row)}
         ON DUPLICATE KEY UPDATE id = id;
       `.unprepared.pipe(
+        // we need 2 queries for mysql, so we need to run them in a
+        // transaction with retries
+        sql.withTransaction,
+        Effect.retry({ times: 3 }),
         Effect.map(([rows]) => rows as any as ReadonlyArray<Row>)
       ),
     mssql: () => (row, message_id) =>
@@ -518,7 +522,8 @@ export const make = Effect.fnUntraced(function*(options?: {
         WHERE m.message_id = ${message_id}
       `.pipe(
         Effect.tap(sql`INSERT OR IGNORE INTO ${messagesTableSql} ${sql.insert(row)}`),
-        sql.withTransaction
+        sql.withTransaction,
+        Effect.retry({ times: 3 })
       )
   })
 
@@ -656,13 +661,12 @@ export const make = Effect.fnUntraced(function*(options?: {
         const rows = statements.length === 1
           ? yield* statements[0]
           : yield* sql<MessageJoinRow>`${statements[0]} UNION ALL ${statements[1]}`
-
-        const messages = Arr.empty<{
+        const messages: Array<{
           readonly envelope: Envelope.Envelope.Encoded
           readonly lastSentReply: Option.Option<Reply.ReplyEncoded<any>>
-        }>()
-        for (const row of rows) {
-          messages.push(messageFromRow(row))
+        }> = new Array(rows.length)
+        for (let i = 0; i < rows.length; i++) {
+          messages[i] = messageFromRow(rows[i])
         }
         const nextCursor = Arr.last(rows).pipe(
           Option.map((row) => BigInt(row.sequence)),

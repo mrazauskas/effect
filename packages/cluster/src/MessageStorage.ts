@@ -457,6 +457,7 @@ export const makeEncoded: (encoded: Encoded) => Effect.Effect<
         )
       }
     )
+
     return Effect.as(
       Effect.whileLoop({
         while: () => index < encodedReplies.length,
