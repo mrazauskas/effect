@@ -53,7 +53,11 @@ export class ShardingConfig extends Context.Tag("@effect/cluster/ShardingConfig"
   /**
    * The interval at which to poll for unprocessed messages from storage.
    */
-  readonly entityStoragePollInterval: DurationInput
+  readonly entityMessagePollInterval: DurationInput
+  /**
+   * The interval at which to poll for client replies from storage.
+   */
+  readonly entityReplyPollInterval: DurationInput
   readonly refreshAssignmentsInterval: DurationInput
   /**
    * The interval to retry a send if EntityNotManagedByPod is returned.
@@ -81,7 +85,8 @@ export const defaults: ShardingConfig["Type"] = {
   entityMailboxCapacity: 4096,
   entityMaxIdleTime: Duration.minutes(1),
   entityTerminationTimeout: Duration.seconds(30),
-  entityStoragePollInterval: Duration.seconds(10),
+  entityMessagePollInterval: Duration.seconds(10),
+  entityReplyPollInterval: Duration.millis(200),
   sendRetryInterval: Duration.millis(100),
   refreshAssignmentsInterval: Duration.minutes(5),
   simulateRemoteSerialization: true
@@ -147,9 +152,13 @@ export const config: Config.Config<ShardingConfig["Type"]> = Config.all({
     Config.withDefault(defaults.entityTerminationTimeout),
     Config.withDescription("The maximum duration of time to wait for an entity to terminate.")
   ),
-  entityStoragePollInterval: Config.duration("entityStoragePollInterval").pipe(
-    Config.withDefault(defaults.entityStoragePollInterval),
+  entityMessagePollInterval: Config.duration("entityMessagePollInterval").pipe(
+    Config.withDefault(defaults.entityMessagePollInterval),
     Config.withDescription("The interval at which to poll for unprocessed messages from storage.")
+  ),
+  entityReplyPollInterval: Config.duration("entityReplyPollInterval").pipe(
+    Config.withDefault(defaults.entityReplyPollInterval),
+    Config.withDescription("The interval at which to poll for client replies from storage.")
   ),
   sendRetryInterval: Config.duration("sendRetryInterval").pipe(
     Config.withDefault(defaults.sendRetryInterval),

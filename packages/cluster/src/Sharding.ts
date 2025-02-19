@@ -346,7 +346,7 @@ export const make = Effect.gen(function*() {
       Effect.scoped,
       Effect.ensuring(storageReadLock.releaseAll),
       Effect.catchAllCause((cause) => Effect.logWarning("Could not read messages from storage", cause)),
-      Effect.repeat(Schedule.spaced(config.entityStoragePollInterval)),
+      Effect.repeat(Schedule.spaced(config.entityMessagePollInterval)),
       Effect.annotateLogs({
         package: "@effect/cluster",
         module: "Sharding",
@@ -358,7 +358,7 @@ export const make = Effect.gen(function*() {
     )
 
     yield* storageLatch.open.pipe(
-      Effect.delay(config.entityStoragePollInterval),
+      Effect.delay(config.entityMessagePollInterval),
       Effect.forever,
       Effect.interruptible,
       Effect.forkIn(shardingScope)
@@ -412,7 +412,7 @@ export const make = Effect.gen(function*() {
 
           // this should not happen, but we handle it just in case
           if (messages.length === 0) {
-            yield* Effect.sleep(config.entityStoragePollInterval)
+            yield* Effect.sleep(config.entityMessagePollInterval)
             continue
           }
 
@@ -462,7 +462,7 @@ export const make = Effect.gen(function*() {
       },
       Effect.retry({
         while: (e) => e._tag === "MessagePersistenceError",
-        schedule: Schedule.spaced(config.entityStoragePollInterval)
+        schedule: Schedule.spaced(config.entityMessagePollInterval)
       }),
       Effect.catchAllCause((cause) => Effect.logError("Could not resume unprocessed messages", cause)),
       (effect, address) =>

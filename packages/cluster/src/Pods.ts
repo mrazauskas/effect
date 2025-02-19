@@ -20,7 +20,7 @@ import * as Message from "./Message.js"
 import * as MessageStorage from "./MessageStorage.js"
 import type { PodAddress } from "./PodAddress.js"
 import * as Reply from "./Reply.js"
-import type { ShardingConfig } from "./ShardingConfig.js"
+import { ShardingConfig } from "./ShardingConfig.js"
 import { AlreadyProcessingMessage, EntityNotManagedByPod, MailboxFull, PodUnavailable } from "./ShardingError.js"
 import * as Snowflake from "./Snowflake.js"
 
@@ -97,10 +97,11 @@ export class Pods extends Context.Tag("@effect/cluster/Pods")<Pods, {
 export const make: (options: Omit<Pods["Type"], "sendLocal" | "notifyLocal">) => Effect.Effect<
   Pods["Type"],
   never,
-  MessageStorage.MessageStorage | Snowflake.Generator | Scope
+  MessageStorage.MessageStorage | Snowflake.Generator | ShardingConfig | Scope
 > = Effect.fnUntraced(function*(options: Omit<Pods["Type"], "sendLocal" | "notifyLocal">) {
   const storage = yield* MessageStorage.MessageStorage
   const snowflakeGen = yield* Snowflake.Generator
+  const config = yield* ShardingConfig
 
   const requestIdRewrites = new Map<Snowflake.Snowflake, Snowflake.Snowflake>()
 
@@ -250,12 +251,13 @@ export const make: (options: Omit<Pods["Type"], "sendLocal" | "notifyLocal">) =>
       Effect.forkScoped
     )
 
-    yield* Effect.sync(() => {
-      if (waitingStorageRequests.size > 0) {
-        storageLatch.unsafeOpen()
+    yield* Effect.suspend(() => {
+      if (waitingStorageRequests.size === 0) {
+        return storageLatch.await
       }
+      return storageLatch.open
     }).pipe(
-      Effect.delay(500),
+      Effect.delay(config.entityReplyPollInterval),
       Effect.forever,
       Effect.interruptible,
       Effect.forkScoped
@@ -323,7 +325,7 @@ export const make: (options: Omit<Pods["Type"], "sendLocal" | "notifyLocal">) =>
 export const makeNoop: Effect.Effect<
   Pods["Type"],
   never,
-  MessageStorage.MessageStorage | Snowflake.Generator | Scope
+  MessageStorage.MessageStorage | Snowflake.Generator | ShardingConfig | Scope
 > = make({
   send: ({ message }) => Effect.fail(new EntityNotManagedByPod({ address: message.envelope.address })),
   notify: () => Effect.void,
@@ -403,7 +405,7 @@ export const makeRpcClient: Effect.Effect<
 export const makeRpc: Effect.Effect<
   Pods["Type"],
   never,
-  Scope | RpcClientProtocol | MessageStorage.MessageStorage | Snowflake.Generator
+  Scope | RpcClientProtocol | MessageStorage.MessageStorage | Snowflake.Generator | ShardingConfig
 > = Effect.gen(function*() {
   const makeClientProtocol = yield* RpcClientProtocol
   const snowflakeGen = yield* Snowflake.Generator
