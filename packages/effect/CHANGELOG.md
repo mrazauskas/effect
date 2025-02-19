@@ -1,5 +1,11 @@
 # effect
 
+## 3.13.3
+
+### Patch Changes
+
+- [#4419](https://github.com/Effect-TS/effect/pull/4419) [`d7f6a5c`](https://github.com/Effect-TS/effect/commit/d7f6a5c7d26c1963dcd864ca62360d20d08c7b49) Thanks @KhraksMamtsov! - Fix Context.Tag unification
+
 ## 3.13.2
 
 ### Patch Changes
