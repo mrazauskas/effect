@@ -175,10 +175,17 @@ export const make = Effect.fnUntraced(function*(options?: {
 
         CREATE INDEX IF NOT EXISTS ${sql(requestIdLookupIndex)}
         ON ${messagesTableSql} (request_id);
-      `.pipe(Effect.retry({
-        times: 3,
-        schedule: Schedule.spaced(1000)
-      })),
+      `.pipe(
+        Effect.tapDefect((error) =>
+          Effect.annotateLogs(Effect.logDebug("Failed to create indexes", error), {
+            package: "@effect/cluster",
+            module: "SqlMessageStorage"
+          })
+        ),
+        Effect.retry({
+          schedule: Schedule.spaced(1000)
+        })
+      ),
     orElse: () =>
       // sqlite
       Effect.all([
@@ -267,7 +274,17 @@ export const make = Effect.fnUntraced(function*(options?: {
       sql`
         CREATE INDEX IF NOT EXISTS ${sql(replyLookupIndex)}
         ON ${repliesTableSql} (request_id, kind, acked);
-      `,
+`.pipe(
+        Effect.tapDefect((error) =>
+          Effect.annotateLogs(Effect.logDebug("Failed to create indexes", error), {
+            package: "@effect/cluster",
+            module: "SqlMessageStorage"
+          })
+        ),
+        Effect.retry({
+          schedule: Schedule.spaced(1000)
+        })
+      ),
     orElse: () =>
       // sqlite
       sql`
@@ -660,7 +677,7 @@ export const make = Effect.fnUntraced(function*(options?: {
 
         const rows = statements.length === 1
           ? yield* statements[0]
-          : yield* sql<MessageJoinRow>`${statements[0]} UNION ALL ${statements[1]}`
+          : yield* sql<MessageJoinRow>`(${statements[0]}) UNION ALL (${statements[1]})`
         const messages: Array<{
           readonly envelope: Envelope.Envelope.Encoded
           readonly lastSentReply: Option.Option<Reply.ReplyEncoded<any>>
