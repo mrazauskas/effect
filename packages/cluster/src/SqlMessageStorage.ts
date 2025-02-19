@@ -586,7 +586,7 @@ export const make = Effect.fnUntraced(function*(options?: {
       sql<ReplyRow>`
         SELECT id, kind, request_id, payload, sequence
         FROM ${repliesTableSql}
-        WHERE ${sql.in("request_id", requestIds)}
+        WHERE request_id IN (${sql.literal(requestIds.join(","))})
         AND (
           kind = ${replyKindWithExit}
           OR (
@@ -620,7 +620,7 @@ export const make = Effect.fnUntraced(function*(options?: {
       function*(options) {
         const newShards = options.newShards
         const existingShards = options.existingShards
-        const cursor = Option.getOrElse(options.cursor, () => 0)
+        const cursor = Option.getOrElse(options.cursor, () => BigInt(0))
 
         // For new shards: get unfinished requests and their interrupts
         const statements = Arr.empty<Statement<MessageJoinRow>>()
@@ -629,7 +629,7 @@ export const make = Effect.fnUntraced(function*(options?: {
             SELECT m.*, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
             FROM ${messagesTableSql} m
             LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
-            WHERE ${sql.in("m.shard_id", newShards)}
+            WHERE m.shard_id IN (${sql.literal(newShards.map(String).join(","))})
             AND m.processed = ${sqlFalse}
             AND m.kind <> ${messageKindAckChunk}
             ORDER BY m.sequence ASC
@@ -642,9 +642,9 @@ export const make = Effect.fnUntraced(function*(options?: {
             SELECT m.*, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
             FROM ${messagesTableSql} m
             LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
-            WHERE ${sql.in("m.shard_id", existingShards)}
+            WHERE m.shard_id IN (${sql.literal(existingShards.map(String).join(","))})
             AND m.processed = ${sqlFalse}
-            AND m.sequence > ${cursor}
+            AND m.sequence > ${sql.literal(String(cursor))}
             ORDER BY m.sequence ASC
           `)
         }
@@ -661,16 +661,14 @@ export const make = Effect.fnUntraced(function*(options?: {
           readonly envelope: Envelope.Envelope.Encoded
           readonly lastSentReply: Option.Option<Reply.ReplyEncoded<any>>
         }>()
-        let maxSequence = cursor
         for (const row of rows) {
-          const sequence = Number(row.sequence)
           messages.push(messageFromRow(row))
-          if (sequence > maxSequence) {
-            maxSequence = sequence
-          }
         }
-
-        return [messages, Option.some(maxSequence)] as const
+        const nextCursor = Arr.last(rows).pipe(
+          Option.map((row) => BigInt(row.sequence)),
+          Option.getOrElse(() => cursor)
+        )
+        return [messages, Option.some(nextCursor)] as const
       },
       Effect.provideService(SqlClient.SafeIntegers, true),
       Effect.catchAllCause((cause) => Effect.fail(new MessagePersistenceError({ cause: Cause.squash(cause) })))
@@ -681,7 +679,7 @@ export const make = Effect.fnUntraced(function*(options?: {
       return sql<MessageRow & ReplyJoinRow>`
         SELECT m.*, r.id as reply_id, r.payload as reply_payload, r.sequence as reply_sequence
         FROM ${messagesTableSql} as m
-        WHERE ${sql.in("m.id", idArr)} AND m.processed = 0
+        WHERE m.id IN (${sql.literal(idArr.join(","))}) AND m.processed = 0
         LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
         ORDER BY m.sequence ASC
       `.pipe(

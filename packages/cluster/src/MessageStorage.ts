@@ -322,6 +322,7 @@ export const makeEncoded: (encoded: Encoded) => Effect.Effect<
         requestIds.push(id)
         map.set(id, message)
       }
+      if (requestIds.length === 0) return []
       const encodedReplies = yield* encoded.repliesFor(requestIds)
       return yield* decodeReplies(map, encodedReplies)
     }),
