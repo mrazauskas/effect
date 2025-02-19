@@ -11,6 +11,7 @@ import type { DurationInput } from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Schedule from "effect/Schedule"
 import type * as Envelope from "./Envelope.js"
 import * as MessageStorage from "./MessageStorage.js"
 import { SaveResultEncoded } from "./MessageStorage.js"
@@ -29,6 +30,10 @@ export const make = Effect.fnUntraced(function*(options?: {
   const sql = (yield* SqlClient.SqlClient).withoutTransforms()
   const prefix = options?.prefix ?? "cluster"
   const table = (name: string) => `${prefix}_${name}`
+
+  const messageKindAckChunk = sql.literal(String(messageKind.AckChunk))
+  const replyKindWithExit = sql.literal(String(replyKind.WithExit))
+  const replyKindChunk = sql.literal(String(replyKind.Chunk))
 
   const messagesTable = table("messages")
   const messagesTableSql = sql(messagesTable)
@@ -54,6 +59,7 @@ export const make = Effect.fnUntraced(function*(options?: {
           processed BIT NOT NULL DEFAULT 0,
           request_id BIGINT,
           reply_id BIGINT,
+          last_reply_id BIGINT,
           CONSTRAINT ${sql(messagesTable + "_id")} UNIQUE (message_id)
         )
       `,
@@ -76,6 +82,7 @@ export const make = Effect.fnUntraced(function*(options?: {
           processed BOOLEAN NOT NULL DEFAULT FALSE,
           request_id BIGINT,
           reply_id BIGINT,
+          last_reply_id BIGINT,
           CONSTRAINT ${sql(messagesTable + "_id")} UNIQUE (message_id)
         )
       `,
@@ -98,6 +105,7 @@ export const make = Effect.fnUntraced(function*(options?: {
           processed BOOLEAN NOT NULL DEFAULT FALSE,
           request_id BIGINT,
           reply_id BIGINT,
+          last_reply_id BIGINT,
           CONSTRAINT ${sql(messagesTable + "_id")} UNIQUE (message_id)
         )
       `.pipe(Effect.ignore),
@@ -121,6 +129,7 @@ export const make = Effect.fnUntraced(function*(options?: {
           processed BOOLEAN NOT NULL DEFAULT FALSE,
           request_id INTEGER,
           reply_id INTEGER,
+          last_reply_id INTEGER,
           UNIQUE (message_id)
         )
       `
@@ -128,7 +137,8 @@ export const make = Effect.fnUntraced(function*(options?: {
 
   // Add message indexes optimized for the specific query patterns
   const shardLookupIndex = `${messagesTable}_shard_idx`
-  const idLookupIndex = `${messagesTable}_id_idx`
+  const entityLookupIndex = `${messagesTable}_entity_idx`
+  const requestIdLookupIndex = `${messagesTable}_request_id_idx`
   yield* sql.onDialectOrElse({
     mssql: () =>
       sql`
@@ -136,38 +146,55 @@ export const make = Effect.fnUntraced(function*(options?: {
         CREATE INDEX ${sql(shardLookupIndex)} 
         ON ${messagesTableSql} (shard_id, kind, processed, sequence);
 
-        IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = ${idLookupIndex})
-        CREATE INDEX ${sql(idLookupIndex)}
+        IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = ${entityLookupIndex})
+        CREATE INDEX ${sql(entityLookupIndex)}
         ON ${messagesTableSql} (id, processed, sequence);
+
+        IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = ${requestIdLookupIndex})
+        CREATE INDEX ${sql(requestIdLookupIndex)}
+        ON ${messagesTableSql} (request_id);
       `,
     mysql: () =>
       sql`
         CREATE INDEX ${sql(shardLookupIndex)}
         ON ${messagesTableSql} (shard_id, kind, processed, sequence);
 
-        CREATE INDEX ${sql(idLookupIndex)}
+        CREATE INDEX ${sql(entityLookupIndex)}
         ON ${messagesTableSql} (id, processed, sequence);
+
+        CREATE INDEX ${sql(requestIdLookupIndex)}
+        ON ${messagesTableSql} (request_id);
       `.unprepared.pipe(Effect.ignore),
     pg: () =>
       sql`
         CREATE INDEX IF NOT EXISTS ${sql(shardLookupIndex)}
         ON ${messagesTableSql} (shard_id, kind, processed, sequence);
 
-        CREATE INDEX IF NOT EXISTS ${sql(idLookupIndex)}
+        CREATE INDEX IF NOT EXISTS ${sql(entityLookupIndex)}
         ON ${messagesTableSql} (id, processed, sequence);
-      `.unprepared.pipe(Effect.ignore),
+
+        CREATE INDEX IF NOT EXISTS ${sql(requestIdLookupIndex)}
+        ON ${messagesTableSql} (request_id);
+      `.pipe(Effect.retry({
+        times: 3,
+        schedule: Schedule.spaced(500)
+      })),
     orElse: () =>
       // sqlite
-      Effect.andThen(
+      Effect.all([
         sql`
           CREATE INDEX IF NOT EXISTS ${sql(shardLookupIndex)}
           ON ${messagesTableSql} (shard_id, kind, processed, sequence)
         `,
         sql`
-          CREATE INDEX IF NOT EXISTS ${sql(idLookupIndex)}
+          CREATE INDEX IF NOT EXISTS ${sql(entityLookupIndex)}
           ON ${messagesTableSql} (id, processed, sequence)
+        `,
+        sql`
+          CREATE INDEX IF NOT EXISTS ${sql(requestIdLookupIndex)}
+          ON ${messagesTableSql} (request_id)
         `
-      )
+      ]).pipe(sql.withTransaction)
   })
 
   const repliesTable = table("replies")
@@ -408,15 +435,6 @@ export const make = Effect.fnUntraced(function*(options?: {
     }
   }
 
-  const latestReplies = sql<ReplyRow>`
-    SELECT id, kind, request_id, payload, sequence
-    FROM ${repliesTableSql}
-    WHERE id IN (
-      SELECT MAX(id) as id
-      FROM ${repliesTableSql}
-      GROUP BY request_id
-    )
-  `
   const sqlFalse = sql.literal(supportsBooleans ? "FALSE" : "0")
   const sqlTrue = sql.literal(supportsBooleans ? "TRUE" : "1")
 
@@ -435,11 +453,10 @@ export const make = Effect.fnUntraced(function*(options?: {
               existing AS (
                 SELECT m.id, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
                 FROM ${messagesTableSql} m
-                LEFT JOIN ${repliesTableSql} r ON r.request_id = m.id
+                LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
                 WHERE m.message_id = ${message_id}
                 AND NOT EXISTS (SELECT 1 FROM inserted)
                 ORDER BY r.id DESC
-                LIMIT 1
               )
               SELECT * FROM existing
             `,
@@ -447,10 +464,9 @@ export const make = Effect.fnUntraced(function*(options?: {
             sql`
               SELECT m.id, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
               FROM ${messagesTableSql} m
-              LEFT JOIN ${repliesTableSql} r ON r.request_id = m.id
+              LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
               WHERE m.message_id = ${message_id}
-              ORDER BY r.id DESC
-              LIMIT 1;
+              ORDER BY r.id DESC;
               INSERT INTO ${messagesTableSql} ${sql.insert(row)}
               ON DUPLICATE KEY UPDATE id = id;
 `.unprepared.pipe(
@@ -469,7 +485,7 @@ export const make = Effect.fnUntraced(function*(options?: {
                   WHEN inserted.id IS NULL THEN (
                     SELECT TOP 1 r.id, r.kind, r.payload
                     FROM ${repliesTableSql} r
-                    WHERE r.request_id = target.id
+                    WHERE r.id = target.last_reply_id
                     ORDER BY r.id DESC
                   )
                 END as reply_id,
@@ -477,24 +493,21 @@ export const make = Effect.fnUntraced(function*(options?: {
                   WHEN inserted.id IS NULL THEN (
                     SELECT TOP 1 r.kind
                     FROM ${repliesTableSql} r
-                    WHERE r.request_id = target.id
-                    ORDER BY r.id DESC
+                    WHERE r.id = target.last_reply_id
                   )
                 END as reply_kind,
                 CASE
                   WHEN inserted.id IS NULL THEN (
                     SELECT TOP 1 r.payload
                     FROM ${repliesTableSql} r
-                    WHERE r.request_id = target.id
-                    ORDER BY r.id DESC
+                    WHERE r.id = target.last_reply_id
                   )
                 END as reply_payload,
                 CASE
                   WHEN inserted.id IS NULL THEN (
                     SELECT TOP 1 r.sequence
                     FROM ${repliesTableSql} r
-                    WHERE r.request_id = target.id
-                    ORDER BY r.id DESC
+                    WHERE r.id = target.last_reply_id
                   )
                 END as reply_sequence;
               `,
@@ -502,11 +515,9 @@ export const make = Effect.fnUntraced(function*(options?: {
             sql`
               SELECT m.id, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
               FROM ${messagesTableSql} m
-              LEFT JOIN ${repliesTableSql} r ON r.request_id = m.id
+              LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
               WHERE m.message_id = ${message_id}
-              ORDER BY r.id DESC
-              LIMIT 1
-`.pipe(
+            `.pipe(
               Effect.tap(sql`INSERT OR IGNORE INTO ${messagesTableSql} ${sql.insert(row)}`),
               sql.withTransaction
             )
@@ -550,12 +561,13 @@ export const make = Effect.fnUntraced(function*(options?: {
       Effect.suspend(() => {
         const row = replyToRow(reply)
         const insert = sql`INSERT INTO ${repliesTableSql} ${sql.insert(row)}`
-        return reply._tag === "WithExit" ?
-          insert.pipe(
-            Effect.andThen(sql`UPDATE ${messagesTableSql} SET processed = ${sqlTrue} WHERE id = ${reply.requestId}`),
-            sql.withTransaction
-          ) :
-          insert
+        const update = reply._tag === "Chunk" ?
+          sql`UPDATE ${messagesTableSql} SET last_reply_id = ${reply.id} WHERE id = ${reply.requestId}` :
+          sql`UPDATE ${messagesTableSql} SET processed = ${sqlTrue} WHERE id = ${reply.requestId} OR request_id = ${reply.requestId}`
+        return insert.pipe(
+          Effect.andThen(update),
+          sql.withTransaction
+        )
       }).pipe(
         Effect.asVoid,
         Effect.catchAllCause((cause) => Effect.fail(new MessagePersistenceError({ cause: Cause.squash(cause) })))
@@ -571,9 +583,9 @@ export const make = Effect.fnUntraced(function*(options?: {
         FROM ${repliesTableSql}
         WHERE ${sql.in("request_id", requestIds)}
         AND (
-          kind = ${sql.literal(String(replyKind.WithExit))}
+          kind = ${replyKindWithExit}
           OR (
-            kind = ${sql.literal(String(replyKind.Chunk))}
+            kind = ${replyKindChunk}
             AND acked = ${sqlFalse}
           )
         )
@@ -611,17 +623,10 @@ export const make = Effect.fnUntraced(function*(options?: {
           statements.push(sql<MessageJoinRow>`
             SELECT m.*, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
             FROM ${messagesTableSql} m
-            LEFT JOIN (${latestReplies}) r ON r.request_id = m.id
+            LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
             WHERE ${sql.in("m.shard_id", newShards)}
-            AND (
-              -- Get unprocessed requests
-              (m.kind = ${sql.literal(String(messageKind.Request))} AND m.processed = ${sqlFalse})
-              -- Get interrupts for unprocessed requests
-              OR (m.kind = ${sql.literal(String(messageKind.Interrupt))} AND EXISTS (
-                SELECT 1 FROM ${messagesTableSql} m2 
-                WHERE m2.id = m.request_id AND m2.processed = ${sqlFalse}
-              ))
-            )
+            AND m.processed = ${sqlFalse}
+            AND m.kind <> ${messageKindAckChunk}
             ORDER BY m.sequence ASC
           `)
         }
@@ -631,7 +636,7 @@ export const make = Effect.fnUntraced(function*(options?: {
           statements.push(sql<MessageJoinRow>`
             SELECT m.*, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
             FROM ${messagesTableSql} m
-            LEFT JOIN (${latestReplies}) r ON r.request_id = m.id
+            LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
             WHERE ${sql.in("m.shard_id", existingShards)}
             AND m.processed = ${sqlFalse}
             AND m.sequence > ${cursor}
@@ -672,7 +677,8 @@ export const make = Effect.fnUntraced(function*(options?: {
         SELECT m.*, r.id as reply_id, r.payload as reply_payload, r.sequence as reply_sequence
         FROM ${messagesTableSql} as m
         WHERE ${sql.in("m.id", idArr)} AND m.processed = 0
-        LEFT JOIN (${latestReplies}) r ON r.request_id = m.id
+        LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
+        ORDER BY m.sequence ASC
       `.pipe(
         Effect.map(Arr.map(messageFromRow)),
         Effect.provideService(SqlClient.SafeIntegers, true),
