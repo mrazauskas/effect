@@ -23,7 +23,7 @@ import * as Snowflake from "./Snowflake.js"
  * @since 1.0.0
  * @category Constructors
  */
-export const makeSql = Effect.fnUntraced(function*(options?: {
+export const make = Effect.fnUntraced(function*(options?: {
   readonly prefix?: string | undefined
 }) {
   const sql = (yield* SqlClient.SqlClient).withoutTransforms()
@@ -404,6 +404,7 @@ export const makeSql = Effect.fnUntraced(function*(options?: {
               WITH inserted AS (
                 INSERT INTO ${messagesTableSql} ${sql.insert(row)}
                 ON CONFLICT (message_id) DO NOTHING
+                RETURNING id
               ),
               existing AS (
                 SELECT m.id, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
@@ -663,7 +664,7 @@ export const layer: Layer.Layer<
   MessageStorage.MessageStorage,
   SqlError,
   SqlClient.SqlClient | ShardingConfig
-> = Layer.scoped(MessageStorage.MessageStorage, makeSql()).pipe(
+> = Layer.scoped(MessageStorage.MessageStorage, make()).pipe(
   Layer.provide(Snowflake.layerGenerator)
 )
 
@@ -675,7 +676,7 @@ export const layerWith = (options: {
   readonly prefix?: string | undefined
   readonly replyPollInterval?: DurationInput | undefined
 }): Layer.Layer<MessageStorage.MessageStorage, SqlError, SqlClient.SqlClient | ShardingConfig> =>
-  Layer.scoped(MessageStorage.MessageStorage, makeSql(options)).pipe(
+  Layer.scoped(MessageStorage.MessageStorage, make(options)).pipe(
     Layer.provide(Snowflake.layerGenerator)
   )
 
