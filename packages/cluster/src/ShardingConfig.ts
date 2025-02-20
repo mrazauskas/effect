@@ -84,7 +84,7 @@ export const defaults: ShardingConfig["Type"] = {
   shardManagerAddress: PodAddress.make({ host: "localhost", port: 8080 }),
   entityMailboxCapacity: 4096,
   entityMaxIdleTime: Duration.minutes(1),
-  entityTerminationTimeout: Duration.seconds(30),
+  entityTerminationTimeout: Duration.minutes(1),
   entityMessagePollInterval: Duration.seconds(10),
   entityReplyPollInterval: Duration.millis(200),
   sendRetryInterval: Duration.millis(100),

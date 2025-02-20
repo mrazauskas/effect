@@ -1,7 +1,7 @@
 import type * as Rpc from "@effect/rpc/Rpc"
 import { RequestId } from "@effect/rpc/RpcMessage"
 import * as RpcServer from "@effect/rpc/RpcServer"
-import { Duration } from "effect"
+import { Duration, FiberSet } from "effect"
 import * as Arr from "effect/Array"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
@@ -25,6 +25,7 @@ import type { EntityId } from "../EntityId.js"
 import * as Envelope from "../Envelope.js"
 import * as Message from "../Message.js"
 import * as Reply from "../Reply.js"
+import type { ShardId } from "../ShardId.js"
 import { Sharding } from "../Sharding.js"
 import { ShardingConfig } from "../ShardingConfig.js"
 import { AlreadyProcessingMessage, EntityNotManagedByPod, MailboxFull, MalformedMessage } from "../ShardingError.js"
@@ -42,12 +43,15 @@ export interface EntityManager {
   ) => Effect.Effect<void, EntityNotManagedByPod | MailboxFull | AlreadyProcessingMessage>
 
   readonly isProcessingFor: (message: Message.IncomingEnvelope) => boolean
+
+  readonly interruptShard: (shardId: ShardId) => Effect.Effect<void>
 }
 
 // Represents the entities managed by this entity manager
 /** @internal */
 export type EntityState = {
   readonly address: EntityAddress
+  readonly mailboxGauge: Metric.Metric.Gauge<bigint>
   readonly write: RpcServer.RpcServer<any>["write"]
   readonly activeRequests: Map<bigint, {
     readonly rpc: Rpc.AnyWithProps
@@ -80,7 +84,6 @@ export const make = Effect.fnUntraced(function*<
   const mailboxCapacity = options.mailboxCapacity ?? config.entityMailboxCapacity
   const clock = yield* Effect.clock
   const context = yield* Effect.context<Rpc.Context<Rpcs> | Rpc.Middleware<Rpcs> | RX>()
-  const gauge = ClusterMetrics.entities.pipe(Metric.tagged("type", entity.type))
 
   const activeServers = new Map<EntityId, EntityState>()
   const entities: RcMap.RcMap<
@@ -186,12 +189,12 @@ export const make = Effect.fnUntraced(function*<
         )
       }
 
-      // Perform metric bookkeeping
-      yield* Metric.increment(gauge)
-      yield* Scope.addFinalizer(scope, Metric.incrementBy(gauge, BigInt(-1)))
-
       const state: EntityState = {
         address,
+        mailboxGauge: ClusterMetrics.mailboxSize.pipe(
+          Metric.tagged("type", entity.type),
+          Metric.tagged("entityId", address.entityId)
+        ),
         write: server.write,
         activeRequests: new Map(),
         lastActiveCheck: clock.unsafeCurrentTimeMillis()
@@ -220,6 +223,19 @@ export const make = Effect.fnUntraced(function*<
       entities
     })
   }
+
+  // update metrics for active servers
+  const gauge = ClusterMetrics.entities.pipe(Metric.tagged("type", entity.type))
+  yield* Effect.sync(() => {
+    gauge.unsafeUpdate(BigInt(activeServers.size), [])
+    for (const state of activeServers.values()) {
+      state.mailboxGauge.unsafeUpdate(BigInt(state.activeRequests.size), [])
+    }
+  }).pipe(
+    Effect.andThen(Effect.sleep(1000)),
+    Effect.forever,
+    Effect.forkIn(managerScope)
+  )
 
   function sendLocal<R extends Rpc.Any>(
     message: Message.IncomingLocal<R>
@@ -292,9 +308,26 @@ export const make = Effect.fnUntraced(function*<
     )
   }
 
+  const interruptShard = Effect.fnUntraced(function*(shardId: ShardId) {
+    while (true) {
+      let fibers: FiberSet.FiberSet | undefined
+      for (const state of activeServers.values()) {
+        if (shardId !== state.address.shardId) {
+          continue
+        }
+        fibers ??= yield* FiberSet.make()
+        yield* RcMap.invalidate(entities, state.address).pipe(
+          FiberSet.run(fibers)
+        )
+      }
+      if (fibers) yield* FiberSet.awaitEmpty(fibers)
+    }
+  }, Effect.scoped)
+
   const decodeMessage = Schema.decode(makeMessageSchema(entity))
 
   return identity<EntityManager>({
+    interruptShard,
     isProcessingFor(message) {
       const state = activeServers.get(message.envelope.address.entityId)
       if (!state) return false

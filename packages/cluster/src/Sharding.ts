@@ -258,14 +258,84 @@ export const make = Effect.gen(function*() {
 
   // --- Storage inbox ---
 
-  const storageLatch = yield* Effect.makeLatch(true)
-  const openStorageLatch = constant(storageLatch.open)
+  const storageReadLatch = yield* Effect.makeLatch(true)
+  const openStorageReadLatch = constant(storageReadLatch.open)
+
   const storageReadLock = Effect.unsafeMakeSemaphore(1)
   const withStorageReadLock = storageReadLock.withPermits(1)
+
+  const storageShards = new Set<ShardId>()
+  const storageShardsLatch = yield* Effect.makeLatch(false)
 
   if (storageEnabled && Option.isSome(config.podAddress)) {
     const selfAddress = config.podAddress.value
     const sessionKey = {}
+
+    yield* Scope.addFinalizerExit(
+      shardingScope,
+      () => {
+        storageShards.clear()
+        return Effect.ignore(storage.releaseAllShards(selfAddress))
+      }
+    )
+
+    yield* Effect.gen(function*() {
+      while (true) {
+        yield* storageShardsLatch.await
+
+        const toRelease = new Set<ShardId>()
+        for (const shardId of storageShards) {
+          if (selfShards.has(shardId)) continue
+          toRelease.add(shardId)
+        }
+        const unacquiredShards = new Set<ShardId>()
+        for (const shardId of selfShards) {
+          if (storageShards.has(shardId)) continue
+          unacquiredShards.add(shardId)
+        }
+
+        if (toRelease.size > 0) {
+          yield* releaseShards(toRelease)
+        }
+
+        if (unacquiredShards.size === 0) {
+          yield* storageShardsLatch.close
+          continue
+        }
+
+        const acquired = yield* storage.acquireShards(selfAddress, unacquiredShards)
+        for (const shardId of acquired) {
+          storageShards.add(shardId)
+        }
+        if (acquired.length > 0) {
+          yield* storageReadLatch.open
+        }
+        // yield* Effect.sleep(1000)
+      }
+    }).pipe(
+      Effect.catchAllCause((cause) => Effect.logWarning("Could not acquire/release shards", cause)),
+      Effect.repeat(Schedule.spaced(config.entityMessagePollInterval)),
+      Effect.annotateLogs({
+        package: "@effect/cluster",
+        module: "Sharding",
+        fiber: "Shard acquisition loop",
+        pod: selfAddress
+      }),
+      Effect.interruptible,
+      Effect.forkIn(shardingScope)
+    )
+
+    const releaseShards = (shardIds: Set<ShardId>) =>
+      Effect.forEach(
+        shardIds,
+        (shardId) =>
+          Effect.forEach(
+            entityManagers.values(),
+            (state) => state.manager.interruptShard(shardId),
+            { concurrency: "unbounded" }
+          ).pipe(Effect.andThen(storage.releaseShard(selfAddress, shardId))),
+        { concurrency: "unbounded", discard: true }
+      )
 
     yield* Effect.gen(function*() {
       yield* Effect.logDebug("Starting")
@@ -273,27 +343,27 @@ export const make = Effect.gen(function*() {
 
       while (true) {
         // wait for the next poll interval, or if we get notified of a change
-        yield* storageLatch.await
+        yield* storageReadLatch.await
+
+        // if we get notified of a change, ensure we start a read immediately
+        // next iteration
+        storageReadLatch.unsafeClose()
 
         // the lock is used to ensure resuming entities have a garantee that no
         // more items are added to the unprocessed set while the semaphore is
         // acquired.
         yield* storageReadLock.take(1)
 
-        const messages = yield* storage.unprocessedMessages(selfShards, sessionKey)
-
-        // if we get notified of a change, ensure we start a read immediately
-        // next iteration
-        storageLatch.unsafeClose()
+        const messages = yield* storage.unprocessedMessages(storageShards, sessionKey)
 
         const send = Effect.catchAllCause(
           Effect.suspend(() => {
             const message = messages[index]
-            const state = entityManagers.get(message.envelope.address.entityType)
-            if (!state) {
+            const address = message.envelope.address
+            const state = entityManagers.get(address.entityType)
+            if (!state || !storageShards.has(address.shardId)) {
               return Effect.void
             }
-            const address = message.envelope.address
 
             // If the message might affect a currently processing request, we
             // send it to the entity manager to be processed.
@@ -357,7 +427,8 @@ export const make = Effect.gen(function*() {
       Effect.forkIn(shardingScope)
     )
 
-    yield* storageLatch.open.pipe(
+    // open the storage latch every poll interval
+    yield* storageReadLatch.open.pipe(
       Effect.delay(config.entityMessagePollInterval),
       Effect.forever,
       Effect.interruptible,
@@ -395,8 +466,7 @@ export const make = Effect.gen(function*() {
 
         while (!done) {
           // if the shard is no longer assigned to this pod, we stop
-          if (!selfShards.has(address.shardId)) {
-            MutableHashMap.remove(entityResumptionState, address)
+          if (!storageShards.has(address.shardId)) {
             return
           }
 
@@ -423,6 +493,10 @@ export const make = Effect.gen(function*() {
             EntityNotManagedByPod
           > = Effect.catchTags(
             Effect.suspend(() => {
+              if (!storageShards.has(address.shardId)) {
+                return Effect.fail(new EntityNotManagedByPod({ address }))
+              }
+
               const message = messages[index]
               // check if this is a request that was interrupted
               const interrupt = message._tag === "IncomingRequest" &&
@@ -526,7 +600,7 @@ export const make = Effect.gen(function*() {
       }
 
       const notify = storageEnabled
-        ? openStorageLatch
+        ? openStorageReadLatch
         : () => Effect.dieMessage("Sharding.notifyLocal: storage is disabled")
 
       return message._tag === "IncomingRequest" || message._tag === "IncomingEnvelope"
@@ -770,16 +844,12 @@ export const make = Effect.gen(function*() {
                 MutableHashMap.set(shardAssignments, shard, event.address)
               }
               if (isLocalPod(event.address)) {
-                let shardsAdded = false
                 for (const shardId of event.shards) {
                   if (selfShards.has(shardId)) continue
                   selfShards.add(shardId)
-                  shardsAdded = true
                 }
                 yield* Effect.forkIn(syncSingletons, shardingScope)
-                if (shardsAdded) {
-                  yield* storageLatch.open
-                }
+                yield* storageShardsLatch.open
               }
               break
             }
@@ -792,6 +862,7 @@ export const make = Effect.gen(function*() {
                   selfShards.delete(shard)
                 }
                 yield* Effect.forkIn(syncSingletons, shardingScope)
+                yield* storageShardsLatch.open
               }
               break
             }
@@ -833,7 +904,6 @@ export const make = Effect.gen(function*() {
     const assignments = yield* shardManager.getAssignments
     yield* Effect.logDebug("Received shard assignments", assignments)
 
-    let shardsAdded = false
     for (const [shardId, pod] of assignments) {
       if (Option.isNone(pod)) {
         MutableHashMap.remove(shardAssignments, shardId)
@@ -851,13 +921,10 @@ export const make = Effect.gen(function*() {
         continue
       }
       selfShards.add(shardId)
-      shardsAdded = true
     }
 
     yield* Effect.forkIn(syncSingletons, shardingScope)
-    if (shardsAdded) {
-      yield* storageLatch.open
-    }
+    yield* storageShardsLatch.open
   })
 
   // --- Finalization ---

@@ -15,7 +15,15 @@ export const shards = Metric.gauge("effect_cluster_shards")
  */
 export const entities = Metric.gauge("effect_cluster_entities", {
   bigint: true
-}).pipe(Metric.withConstantInput(BigInt(1)))
+})
+
+/**
+ * @since 1.0.0
+ * @category metrics
+ */
+export const mailboxSize = Metric.gauge("effect_cluster_mailbox_size", {
+  bigint: true
+})
 
 /**
  * @since 1.0.0

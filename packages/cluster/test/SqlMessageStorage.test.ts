@@ -1,4 +1,12 @@
-import { Message, MessageStorage, ShardingConfig, Snowflake, SqlMessageStorage } from "@effect/cluster"
+import {
+  Message,
+  MessageStorage,
+  PodAddress,
+  ShardId,
+  ShardingConfig,
+  Snowflake,
+  SqlMessageStorage
+} from "@effect/cluster"
 import { FileSystem } from "@effect/platform"
 import { NodeFileSystem } from "@effect/platform-node"
 import { Rpc } from "@effect/rpc"
@@ -142,9 +150,36 @@ describe("SqlMessageStorage", () => {
           yield* storage.saveReply(yield* makeReply(request))
           yield* latch.await
         }))
+
+      it.effect("acquireShards", () =>
+        Effect.gen(function*() {
+          const storage = yield* MessageStorage.MessageStorage
+
+          let acquired = yield* storage.acquireShards(podAddress1, [1, 2, 3] as any)
+          expect(acquired).toEqual([1, 2, 3])
+          acquired = yield* storage.acquireShards(podAddress1, [1, 2, 3] as any)
+          expect(acquired).toEqual([1, 2, 3])
+
+          acquired = yield* storage.acquireShards(podAddress2, [1, 2, 3] as any)
+          expect(acquired).toEqual([])
+
+          yield* storage.releaseShard(podAddress1, ShardId.make(1))
+          acquired = yield* storage.acquireShards(podAddress2, [1, 2, 3] as any)
+          expect(acquired).toEqual([1])
+
+          acquired = yield* storage.acquireShards(podAddress1, [1, 2, 3] as any)
+          expect(acquired).toEqual([2, 3])
+
+          yield* storage.releaseAllShards(podAddress1)
+          acquired = yield* storage.acquireShards(podAddress2, [1, 2, 3] as any)
+          expect(acquired).toEqual([1, 2, 3])
+        }))
     })
   })
 })
+
+const podAddress1 = PodAddress.make("localhost", 1234)
+const podAddress2 = PodAddress.make("localhost", 1235)
 
 const SqliteLayer = Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem

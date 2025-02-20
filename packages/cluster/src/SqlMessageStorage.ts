@@ -212,7 +212,7 @@ export const make = Effect.fnUntraced(function*(options?: {
       sql`
         IF OBJECT_ID(N'${repliesTableSql}', N'U') IS NULL
         CREATE TABLE ${repliesTableSql} (
-          id BIGINT NOT NULL,
+          id BIGINT PRIMARY KEY,
           kind INT NOT NULL,
           request_id BIGINT NOT NULL,
           payload TEXT NOT NULL,
@@ -374,6 +374,46 @@ export const make = Effect.fnUntraced(function*(options?: {
         }
     }
   }
+
+  const locksTable = table("locks")
+  const locksTableSql = sql(locksTable)
+
+  yield* sql.onDialectOrElse({
+    mssql: () =>
+      sql`
+        IF OBJECT_ID(N'${locksTableSql}', N'U') IS NULL
+        CREATE TABLE ${locksTableSql} (
+          shard_id INT PRIMARY KEY,
+          address VARCHAR(255) NOT NULL,
+          acquired_at DATETIME NOT NULL
+        )
+      `,
+    mysql: () =>
+      sql`
+        CREATE TABLE IF NOT EXISTS ${locksTableSql} (
+          shard_id INT PRIMARY KEY,
+          address VARCHAR(255) NOT NULL,
+          acquired_at DATETIME NOT NULL
+        )
+      `,
+    pg: () =>
+      sql`
+        CREATE TABLE IF NOT EXISTS ${locksTableSql} (
+          shard_id INT PRIMARY KEY,
+          address VARCHAR(255) NOT NULL,
+          acquired_at TIMESTAMP NOT NULL
+        )
+      `,
+    orElse: () =>
+      // sqlite
+      sql`
+        CREATE TABLE IF NOT EXISTS ${locksTableSql} (
+          shard_id INTEGER PRIMARY KEY,
+          address TEXT NOT NULL,
+          acquired_at DATETIME NOT NULL
+        )
+      `
+  })
 
   const replyToRow = (reply: Reply.ReplyEncoded<any>): ReplyRow => ({
     id: reply.id,
@@ -544,6 +584,14 @@ export const make = Effect.fnUntraced(function*(options?: {
       )
   })
 
+  const sqlNowString = sql.onDialectOrElse({
+    pg: () => "NOW()",
+    mysql: () => "NOW()",
+    mssql: () => "GETDATE()",
+    orElse: () => "CURRENT_TIMESTAMP"
+  })
+  const sqlNow = sql.literal(sqlNowString)
+
   return yield* MessageStorage.makeEncoded({
     saveEnvelope: (envelope, message_id) =>
       Effect.suspend(() => {
@@ -708,7 +756,80 @@ export const make = Effect.fnUntraced(function*(options?: {
         Effect.provideService(SqlClient.SafeIntegers, true),
         Effect.catchAllCause((cause) => Effect.fail(new MessagePersistenceError({ cause: Cause.squash(cause) })))
       )
-    }
+    },
+
+    lockShards: Effect.fnUntraced(
+      function*(address, shardIds) {
+        const addressString = address.toString()
+        const shardIdsArr = Array.from(shardIds)
+        const values = shardIdsArr.map((shardId) => sql`(${shardId}, ${addressString}, ${sqlNow})`)
+
+        yield* sql.onDialectOrElse({
+          pg: () =>
+            sql`
+              INSERT INTO ${locksTableSql} (shard_id, address, acquired_at) VALUES ${sql.csv(values)}
+              ON CONFLICT (shard_id) DO UPDATE
+              SET address = ${addressString}, acquired_at = ${sqlNow}
+              WHERE ${locksTableSql}.address = ${addressString}
+                OR ${locksTableSql}.acquired_at < (${sqlNow} - INTERVAL '90 seconds')
+            `,
+          mysql: () =>
+            sql`
+              INSERT INTO ${locksTableSql} (shard_id, address, acquired_at) VALUES ${sql.csv(values)}
+              ON DUPLICATE KEY UPDATE
+              address = IF(address = VALUES(address) OR acquired_at < DATE_SUB(${sqlNow}, INTERVAL 90 SECOND), VALUES(address), address),
+              acquired_at = IF(address = VALUES(address) OR acquired_at < DATE_SUB(${sqlNow}, INTERVAL 90 SECOND), VALUES(acquired_at), acquired_at)
+            `,
+          mssql: () =>
+            sql`
+              MERGE ${locksTableSql} WITH (HOLDLOCK) AS target
+              USING (SELECT * FROM (VALUES ${sql.csv(values)})) AS source (shard_id, address, acquired_at)
+              ON target.shard_id = source.shard_id
+              WHEN MATCHED AND (target.address = source.address OR DATEDIFF(SECOND, target.acquired_at, ${sqlNow}) > 90) THEN
+                UPDATE SET address = source.address, acquired_at = source.acquired_at
+              WHEN NOT MATCHED THEN
+                INSERT (shard_id, address, acquired_at)
+                VALUES (source.shard_id, source.address, source.acquired_at);
+            `,
+          orElse: () =>
+            // sqlite
+            sql`
+              WITH source(shard_id, address, acquired_at) AS (VALUES ${sql.csv(values)})
+              INSERT INTO ${locksTableSql} (shard_id, address, acquired_at)
+              SELECT source.shard_id, source.address, source.acquired_at
+              FROM source
+              WHERE NOT EXISTS (
+                SELECT 1 FROM ${locksTableSql}
+                WHERE shard_id = source.shard_id
+                AND address != ${addressString}
+                AND (strftime('%s', ${sqlNow}) - strftime('%s', acquired_at)) <= 90
+              )
+              ON CONFLICT(shard_id) DO UPDATE
+              SET address = ${addressString}, acquired_at = ${sqlNow}
+            `
+        })
+
+        const currentLocks = yield* sql<{ shard_id: number }>`
+          SELECT shard_id FROM ${sql(locksTable)}
+          WHERE address = ${addressString} AND ${sql.in("shard_id", shardIdsArr)}
+        `
+        return currentLocks.map((row) => row.shard_id)
+      },
+      sql.withTransaction,
+      Effect.catchAllCause((cause) => Effect.fail(new MessagePersistenceError({ cause: Cause.squash(cause) })))
+    ),
+
+    releaseShard: (address, shardId) =>
+      sql`DELETE FROM ${locksTableSql} WHERE address = ${address.toString()} AND shard_id = ${shardId}`.pipe(
+        Effect.asVoid,
+        Effect.catchAllCause((cause) => Effect.fail(new MessagePersistenceError({ cause: Cause.squash(cause) })))
+      ),
+
+    releaseAllShards: (address) =>
+      sql`DELETE FROM ${locksTableSql} WHERE address = ${address.toString()}`.pipe(
+        Effect.asVoid,
+        Effect.catchAllCause((cause) => Effect.fail(new MessagePersistenceError({ cause: Cause.squash(cause) })))
+      )
   })
 })
 

@@ -18,6 +18,7 @@ import * as Schema from "effect/Schema"
 import type { Scope } from "effect/Scope"
 import * as Envelope from "./Envelope.js"
 import * as Message from "./Message.js"
+import type { PodAddress } from "./PodAddress.js"
 import * as Reply from "./Reply.js"
 import type { ShardId } from "./ShardId.js"
 import type { ShardingConfig } from "./ShardingConfig.js"
@@ -83,6 +84,29 @@ export class MessageStorage extends Context.Tag("@effect/cluster/MessageStorage"
   readonly unprocessedMessagesById: <R extends Rpc.Any>(
     messageIds: Iterable<Snowflake.Snowflake>
   ) => Effect.Effect<Array<Message.Incoming<R>>, MessagePersistenceError>
+
+  /**
+   * Try to acquire the given shard ids for processing.
+   *
+   * It returns an array of shards it was able to acquire.
+   */
+  readonly acquireShards: (
+    address: PodAddress,
+    shardIds: Iterable<ShardId>
+  ) => Effect.Effect<Array<ShardId>, MessagePersistenceError>
+
+  /**
+   * Release the given shard ids.
+   */
+  readonly releaseShard: (
+    address: PodAddress,
+    shardId: ShardId
+  ) => Effect.Effect<void, MessagePersistenceError>
+
+  /**
+   * Release all the shards assigned to the given pod.
+   */
+  readonly releaseAllShards: (address: PodAddress) => Effect.Effect<void, MessagePersistenceError>
 }>() {}
 
 /**
@@ -219,6 +243,30 @@ export type Encoded = {
     }>,
     MessagePersistenceError
   >
+
+  /**
+   * Refresh the lock on the given shards, returning the shards that were
+   * successfully locked.
+   */
+  readonly lockShards: (
+    address: PodAddress,
+    shardIds: Iterable<number>
+  ) => Effect.Effect<Array<number>, MessagePersistenceError>
+
+  /**
+   * Release the lock on the given shards.
+   */
+  readonly releaseShard: (
+    address: PodAddress,
+    shardIds: number
+  ) => Effect.Effect<void, MessagePersistenceError>
+
+  /**
+   * Release the lock on all shards for the given pod.
+   */
+  readonly releaseAllShards: (
+    address: PodAddress
+  ) => Effect.Effect<void, MessagePersistenceError>
 }
 
 /**
@@ -285,6 +333,26 @@ export const makeEncoded: (encoded: Encoded) => Effect.Effect<
     shardIds: Set<ShardId>
     cursor: Option.Option<any>
   }>()
+  let podAddress: PodAddress | undefined
+  const activeShards = new Set<ShardId>()
+
+  // every minute, refresh the shard locks
+  yield* Effect.suspend(() => {
+    if (activeShards.size === 0) return Effect.void
+    return encoded.lockShards(podAddress!, activeShards)
+  }).pipe(
+    Effect.catchAllCause((cause) =>
+      Effect.annotateLogs(Effect.logDebug(cause), {
+        package: "@effect/cluster",
+        module: "MessageStorage",
+        fiber: "Shard lock refresh"
+      })
+    ),
+    Effect.delay("1 minute"),
+    Effect.forever,
+    Effect.interruptible,
+    Effect.forkIn(scope)
+  )
 
   const storage: MessageStorage["Type"] = yield* make({
     saveRequest: (message) =>
@@ -362,7 +430,25 @@ export const makeEncoded: (encoded: Encoded) => Effect.Effect<
     }),
     unprocessedMessagesById(messageIds) {
       return Effect.flatMap(encoded.unprocessedMessagesById(messageIds), decodeMessages)
-    }
+    },
+    acquireShards: Effect.fnUntraced(function*(address, shardIds) {
+      podAddress = address
+      const acquired = yield* encoded.lockShards(address, shardIds)
+      for (const shardId of acquired) {
+        activeShards.add(shardId as ShardId)
+      }
+      return acquired as Array<ShardId>
+    }),
+    releaseShard: Effect.fnUntraced(function*(address, shardId) {
+      activeShards.delete(shardId)
+      yield* encoded.releaseShard(address, shardId).pipe(
+        Effect.onError(() => Effect.sync(() => activeShards.add(shardId)))
+      )
+    }),
+    releaseAllShards: Effect.fnUntraced(function*(address) {
+      activeShards.clear()
+      yield* encoded.releaseAllShards(address)
+    })
   })
 
   const saveReply = (reply: Reply.ReplyWithContext<any>) =>
@@ -487,7 +573,10 @@ export const noop: MessageStorage["Type"] = globalValue(
       saveReply: () => Effect.void,
       repliesFor: () => Effect.succeed([]),
       unprocessedMessages: () => Effect.succeed([]),
-      unprocessedMessagesById: () => Effect.succeed([])
+      unprocessedMessagesById: () => Effect.succeed([]),
+      acquireShards: (_, shardIds) => Effect.succeed(Array.from(shardIds)),
+      releaseShard: () => Effect.void,
+      releaseAllShards: () => Effect.void
     }))
 )
 
@@ -675,7 +764,10 @@ export class MemoryDriver extends Effect.Service<MemoryDriver>()("@effect/cluste
             envelopeIds.add(String(id))
           }
           return unprocessedWith((envelope) => envelopeIds.has(envelope.requestId))
-        })
+        }),
+      lockShards: (_address, shardIds) => Effect.succeed(Array.from(shardIds)),
+      releaseShard: () => Effect.void,
+      releaseAllShards: () => Effect.void
     }
 
     const storage = yield* makeEncoded(encoded)

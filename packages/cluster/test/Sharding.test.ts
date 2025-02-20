@@ -448,7 +448,7 @@ describe.concurrent("Sharding", () => {
 const TestShardingConfig = ShardingConfig.layer({
   entityMailboxCapacity: 10,
   entityTerminationTimeout: 0,
-  entityStoragePollInterval: 5000,
+  entityMessagePollInterval: 5000,
   sendRetryInterval: 100
 })
 
