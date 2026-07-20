@@ -1,5 +1,13 @@
 # effect
 
+## 3.22.1
+
+### Patch Changes
+
+- [#6443](https://github.com/Effect-TS/effect/pull/6443) [`7ccbd9c`](https://github.com/Effect-TS/effect/commit/7ccbd9cfc78c5e0d71c75c06fb69c80ba5a0b0ac) Thanks @coyaSONG! - Clarify that `Context.GenericTag` requires a key.
+
+- [#6507](https://github.com/Effect-TS/effect/pull/6507) [`3d390f2`](https://github.com/Effect-TS/effect/commit/3d390f232bdbc3f0d3d6a2ae3c775084f494b547) Thanks @tim-smart! - Disable unhandled error logging for fibers spawned by `Effect.timeout`.
+
 ## 3.22.0
 
 ### Minor Changes
